@@ -24,7 +24,7 @@ export function initPool(url) {
     max: 6,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 20_000,
-    statement_timeout: 30_000,
+    keepAlive: true,
   });
   pool.on('error', (e) => console.error('db pool error:', e.message));
   return pool;

@@ -1166,6 +1166,10 @@ function renderBanners() {
   if (pend) {
     items.push(banner('info', `${countLabel(pend, 'طلب واحد', 'طلبان', 'طلبات', 'طلبًا')} بانتظار موافقتك (أعضاء أو أجهزة جديدة).`, ['مراجعة', () => showAdmin(st.pendingMembers ? 'team' : 'devices')]));
   }
+  const backupDays = st.lastBackupAt ? (Date.now() - new Date(st.lastBackupAt).getTime()) / 86400_000 : Infinity;
+  if (st.dbPlan !== 'free' && st.entries > 0 && backupDays > 14) {
+    items.push(banner('warn', st.lastBackupAt ? `آخر نسخة احتياطية مشفرة كانت ${relTime(st.lastBackupAt)}. نزّل نسخة جديدة واحفظها خارج الإنترنت.` : 'لم تُنزَّل أي نسخة احتياطية مشفرة بعد. نزّل نسخة واحفظها في مكان آمن خارج الإنترنت.', ['النسخ الاحتياطي', () => showAdmin('backup')]));
+  }
   if (st.dbPlan === 'free' && st.dbCreatedAt) {
     const left = Math.ceil((new Date(st.dbCreatedAt).getTime() + 30 * 86400_000 - Date.now()) / 86400_000);
     const backupAge = st.lastBackupAt ? (Date.now() - new Date(st.lastBackupAt).getTime()) / 86400_000 : Infinity;
