@@ -77,7 +77,7 @@ with sync_playwright() as p:
     browser = p.chromium.launch(channel='chrome', headless=True, args=['--no-sandbox'])
 
     # ---------- admin: first-run setup ----------
-    ctx = browser.new_context(viewport={'width': 1366, 'height': 900}, locale='ar-EG')
+    ctx = browser.new_context(viewport={'width': 1366, 'height': 900}, locale='ar-EG', timezone_id='Africa/Cairo')
     ctx.grant_permissions(['clipboard-read', 'clipboard-write'], origin=BASE)
     probe = ctx.new_page()
     resp = probe.goto(f'{BASE}/')
@@ -250,6 +250,8 @@ with sync_playwright() as p:
     for name in ['old-client.com', 'star-style-db', 'starstyle.com (.COM Domain)', 'Business Web Hosting', 'Cairo Gym']:
         expect(soon).to_contain_text(name, timeout=15000)
     expect(soon).not_to_contain_text('nilefoods.net')
+    # A domain ending at 23:59:59 UTC in 9 days reads "in 9 days" in Cairo too, with its name in letters.
+    expect(soon.locator('.person').filter(has_text='bücher.de')).to_contain_text('بعد 9 أيام')
     shot(page, '15b-admin-renewals')
 
     page.get_by_role('tab', name='النسخ الاحتياطي').click()

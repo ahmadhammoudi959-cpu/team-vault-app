@@ -5,6 +5,12 @@ import { pathToFileURL } from 'node:url';
 
 const DAY = 86_400_000;
 const at = (days) => new Date(Date.now() + days * DAY).toISOString();
+// Hostinger reports a domain's end as the last second of a UTC day.
+const endOfDay = (days) => {
+  const d = new Date(Date.now() + days * DAY);
+  d.setUTCHours(23, 59, 59, 0);
+  return d.toISOString();
+};
 
 export function startMockApis({ port = 0, hostingerToken, renderToken } = {}) {
   const calls = [];
@@ -23,6 +29,7 @@ export function startMockApis({ port = 0, hostingerToken, renderToken } = {}) {
           { id: 1, domain: 'starstyle.com', type: 'domain', status: 'active', created_at: at(-355), expires_at: at(10) },
           { id: 2, domain: 'nilefoods.net', type: 'domain', status: 'active', created_at: at(-100), expires_at: at(265) },
           { id: 3, domain: 'old-client.com', type: 'domain', status: 'expired', created_at: at(-400), expires_at: at(-5) },
+          { id: 4, domain: 'xn--bcher-kva.de', type: 'domain', status: 'active', created_at: at(-356), expires_at: endOfDay(9) },
         ]);
       }
       if (url.pathname === '/api/billing/v1/subscriptions') {

@@ -1,6 +1,7 @@
 // Read-only connections to Hostinger and Render, used for renewal reminders.
 // Tokens come only from the server's environment, are sent only to the two fixed API hosts,
 // only with GET requests, and are never logged or returned to the browser.
+import { domainToUnicode } from 'node:url';
 
 const HOSTINGER_BASE = (process.env.HOSTINGER_API_BASE || 'https://developers.hostinger.com').replace(/\/+$/, '');
 const RENDER_BASE = (process.env.RENDER_API_BASE || 'https://api.render.com/v1').replace(/\/+$/, '');
@@ -20,6 +21,16 @@ const date = (v) => {
   return Number.isFinite(t) ? new Date(t).toISOString() : null;
 };
 const listOf = (body) => (Array.isArray(body) ? body : Array.isArray(body && body.data) ? body.data : []);
+// Domains with non-Latin letters arrive in punycode ("xn--..."); show them the way people type them.
+const domainName = (v) => {
+  const raw = str(v).trim();
+  if (!raw.toLowerCase().includes('xn--')) return raw;
+  try {
+    return domainToUnicode(raw) || raw;
+  } catch {
+    return raw;
+  }
+};
 
 async function getJson(url, token) {
   let res;
@@ -59,7 +70,7 @@ export async function hostingerSnapshot(token) {
   ]);
   const domains = listOf(settle(d, errors, 'domains')).slice(0, MAX_ITEMS).map((x) => ({
     id: str(x.id, 40),
-    name: str(x.domain),
+    name: domainName(x.domain),
     type: str(x.type, 40),
     status: str(x.status, 40),
     expiresAt: date(x.expires_at),
@@ -143,12 +154,14 @@ const DAY = 86_400_000;
 export const LIVE_SUBSCRIPTION = new Set(['active', 'not_renewing', 'non_renewing', 'in_trial', 'paused']);
 
 // Items that end within `windowDays` (or already ended), for banners. Small and name-only.
+// Days are whole calendar days to the end date as the provider shows it (its UTC date):
+// a domain ending 2026-11-30T23:59:59Z is "9 days" on 2026-11-21, as in hPanel.
 export function upcoming({ hostinger, render }, windowDays = 30, now = Date.now()) {
   const items = [];
   const push = (title, at, source) => {
     const t = Date.parse(at);
     if (!Number.isFinite(t)) return;
-    const days = Math.ceil((t - now) / DAY);
+    const days = Math.floor(t / DAY) - Math.floor(now / DAY);
     if (days <= windowDays) items.push({ title, at, source, days });
   };
   if (hostinger && !hostinger.error) {

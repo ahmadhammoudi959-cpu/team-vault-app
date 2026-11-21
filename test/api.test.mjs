@@ -312,7 +312,8 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
   await t.test('renewals come from Hostinger and Render with read-only calls', async () => {
     const r = await A.api('GET', '/admin/renewals?refresh=1');
     assert.equal(r.status, 200, JSON.stringify(r.data));
-    assert.equal(r.data.hostinger.domains.length, 3);
+    assert.equal(r.data.hostinger.domains.length, 4);
+    assert.ok(r.data.hostinger.domains.some((x) => x.name === 'bücher.de'), 'punycode domains are shown in letters');
     assert.equal(r.data.hostinger.subscriptions.find((x) => x.id === 'sub-1').renewalPrice, 155.88);
     assert.equal(r.data.render.services.length, 2);
     assert.ok(r.data.render.databases.find((x) => x.name === 'star-style-db').expiresAt);
@@ -327,6 +328,7 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     for (const n of ['star-style-db', 'starstyle.com (.COM Domain)', 'Business Web Hosting', 'old-client.com']) assert.ok(names.includes(n), n);
     for (const n of ['nilefoods.net', 'nilefoods.net (.net Domain)', 'starstyle.com']) assert.ok(!names.includes(n), n);
     assert.equal(st.data.renewals[0].title, 'old-client.com', 'already expired comes first');
+    assert.equal(st.data.renewals.find((x) => x.title === 'bücher.de').days, 9, 'counted in calendar days, like hPanel');
 
     process.env.HOSTINGER_API_BASE = `http://127.0.0.1:${mock.port}`;
     process.env.RENDER_API_BASE = `http://127.0.0.1:${mock.port}/v1`;

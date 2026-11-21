@@ -126,8 +126,10 @@ function norm(s) {
 }
 
 const DAY_MS = 86_400_000;
+// A plain date (YYYY-MM-DD), or a UTC time from the server counted by its UTC calendar day,
+// so a domain ending 2026-11-30T23:59:59Z shows 30 November, the same date hPanel shows.
 function parseDay(v) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || ''));
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T[\d:.]+Z)?$/.exec(String(v || ''));
   const t = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : Date.parse(v);
   return Number.isFinite(t) ? t : null;
 }
