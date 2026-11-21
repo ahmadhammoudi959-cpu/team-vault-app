@@ -166,6 +166,25 @@ export async function openSecret(vaultKey, id, keyVersion, blob) {
   return JSON.parse(td.decode(await aesDec(vaultKey, blob, `team-vault/secret|${id}|${keyVersion}`)));
 }
 
+// Small shared documents (the admins' billing notes), bound to their name and key version.
+export async function sealDoc(vaultKey, name, keyVersion, obj) {
+  return aesEnc(vaultKey, te.encode(JSON.stringify(obj)), `team-vault/doc|${name}|${keyVersion}`);
+}
+
+export async function openDoc(vaultKey, name, keyVersion, blob) {
+  return JSON.parse(td.decode(await aesDec(vaultKey, blob, `team-vault/doc|${name}|${keyVersion}`)));
+}
+
+// Opaque labels (which alerts were seen) that reveal nothing to the server.
+export function hmacKey(rawB64) {
+  return subtle.importKey('raw', fromB64(rawB64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+}
+
+export async function hmacHex(key, text) {
+  const sig = new Uint8Array(await subtle.sign('HMAC', key, te.encode(text)));
+  return Array.from(sig, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function backupKey(password, salt, iterations) {
   const base = await subtle.importKey('raw', normPw(password), 'PBKDF2', false, ['deriveKey']);
   return subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);

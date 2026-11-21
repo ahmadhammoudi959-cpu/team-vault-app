@@ -64,6 +64,13 @@ const ICONS = {
   back: [['path', { d: 'M10 6l6 6-6 6' }]],
   link: [['path', { d: 'M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1' }]],
   calendar: [['rect', { x: 3.5, y: 5, width: 17, height: 15.5, rx: 2 }], ['path', { d: 'M3.5 10h17M8 3v4M16 3v4M8 14h2M14 14h2M8 17h2' }]],
+  bell: [['path', { d: 'M6 16.5V11a6 6 0 1 1 12 0v5.5l1.6 2.2H4.4L6 16.5z' }], ['path', { d: 'M10 21a2.2 2.2 0 0 0 4 0' }]],
+  globe: [['circle', { cx: 12, cy: 12, r: 8.5 }], ['path', { d: 'M3.5 12h17M12 3.5c2.4 2.5 3.6 5.3 3.6 8.5s-1.2 6-3.6 8.5c-2.4-2.5-3.6-5.3-3.6-8.5s1.2-6 3.6-8.5z' }]],
+  server: [['rect', { x: 4, y: 4, width: 16, height: 6.5, rx: 1.5 }], ['rect', { x: 4, y: 13.5, width: 16, height: 6.5, rx: 1.5 }], ['path', { d: 'M7.5 7.25h.01M7.5 16.75h.01M11 7.25h5M11 16.75h5' }]],
+  chart: [['path', { d: 'M4 20h16M7 16.5V12M12 16.5V7M17 16.5V9.5' }]],
+  card: [['rect', { x: 3, y: 5.5, width: 18, height: 13, rx: 2 }], ['path', { d: 'M3 10h18M7 15h3.5' }]],
+  mail: [['rect', { x: 3.5, y: 5.5, width: 17, height: 13, rx: 2 }], ['path', { d: 'm4.5 7.5 7.5 5.5 7.5-5.5' }]],
+  printer: [['path', { d: 'M7 9V3.5h10V9M7 17.5H5a1.5 1.5 0 0 1-1.5-1.5v-5.5A1.5 1.5 0 0 1 5 9h14a1.5 1.5 0 0 1 1.5 1.5V16a1.5 1.5 0 0 1-1.5 1.5h-2' }], ['rect', { x: 7, y: 14, width: 10, height: 6.5, rx: 1 }]],
 };
 
 export function icon(name, size = 20) {

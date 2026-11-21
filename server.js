@@ -25,6 +25,7 @@ const DEVICE_COOKIE = cookieName('vd');
 const SESSION_COOKIE = cookieName('vs');
 const META_MAX = 24_000;
 const SECRET_MAX = 120_000;
+const BILLING_MAX = 400_000;
 const MIN = 60 * 1000;
 
 const app = express();
@@ -749,8 +750,9 @@ api.get('/admin/status', requireAdmin, async (req, res) => {
     dbCreatedAt: await getSetting('db_created_at'),
     lastBackupAt: await getSetting('last_backup_at'),
     recoveryUser: cfg.RECOVERY_USER,
-    renewals: upcoming({ hostinger: integ.hostinger.data, render: integ.render.data }, 30).slice(0, 20),
+    renewals: upcoming({ hostinger: integ.hostinger.data, render: integ.render.data }, 60).slice(0, 300),
     renewalsPending: Object.values(integ).some((slot) => slot.token && !slot.data),
+    noticeReads: (await q('SELECT key FROM notice_reads WHERE user_id = $1 ORDER BY read_at DESC LIMIT 3000', [req.session.user_id])).rows.map((x) => x.key),
   });
 });
 
@@ -762,7 +764,49 @@ api.get('/admin/renewals', requireAdmin, async (req, res) => {
   }
   await Promise.all([refreshIntegration('hostinger', force), refreshIntegration('render', force)]);
   if (force) await audit(req, 'renewals_refresh');
-  res.json({ windowDays: 30, hostinger: integrationView('hostinger'), render: integrationView('render') });
+  res.json({ windowDays: 60, hostinger: integrationView('hostinger'), render: integrationView('render') });
+});
+
+// The admins' billing document (client of each subscription, what we charge, extra costs).
+// Encrypted in the browser with the vault key; the server adds its own layer and an edit counter.
+api.get('/admin/billing', requireAdmin, async (req, res) => {
+  const r = (await q('SELECT key_version, blob_ct, revision, updated_at FROM billing_doc WHERE id = 1')).rows[0];
+  res.json(r ? { keyVersion: r.key_version, blob: srvDec('billing-doc', r.blob_ct), revision: r.revision, updatedAt: r.updated_at } : { blob: null, revision: 0 });
+});
+
+api.put('/admin/billing', requireAdmin, async (req, res) => {
+  const b = req.body || {};
+  const keyVersion = v.int(b.keyVersion, 1, 1e9, 'keyVersion');
+  const blob = v.blob(b.blob, BILLING_MAX, 'blob');
+  const base = v.int(b.revision, 0, 1e9, 'revision');
+  const revision = await tx(async (c) => {
+    const vault = await lockVault(c);
+    if (vault.keyVersion !== keyVersion) throw new HttpError(409, 'key_changed');
+    const cur = (await c.query('SELECT revision FROM billing_doc WHERE id = 1 FOR UPDATE')).rows[0];
+    if ((cur ? cur.revision : 0) !== base) throw new HttpError(409, 'billing_changed');
+    await c.query(
+      `INSERT INTO billing_doc (id, key_version, blob_ct, revision, updated_by, updated_at) VALUES (1, $1, $2, $3, $4, now())
+       ON CONFLICT (id) DO UPDATE SET key_version = EXCLUDED.key_version, blob_ct = EXCLUDED.blob_ct,
+         revision = EXCLUDED.revision, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+      [keyVersion, srvEnc('billing-doc', blob), base + 1, req.session.user_id],
+    );
+    return base + 1;
+  });
+  await audit(req, 'billing_update');
+  res.json({ ok: true, revision });
+});
+
+// Alerts an admin has seen. Keys are opaque HMACs made in the browser.
+api.post('/admin/notices/read', requireAdmin, async (req, res) => {
+  const keys = req.body && req.body.keys;
+  if (!Array.isArray(keys) || keys.length > 500 || keys.some((k) => typeof k !== 'string' || !/^[a-f0-9]{64}$/.test(k))) {
+    throw new HttpError(400, 'invalid', { field: 'keys' });
+  }
+  if (keys.length) {
+    await q('INSERT INTO notice_reads (user_id, key) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING', [req.session.user_id, keys]);
+  }
+  await q("DELETE FROM notice_reads WHERE user_id = $1 AND read_at < now() - interval '400 days'", [req.session.user_id]);
+  res.json({ ok: true });
 });
 
 api.get('/admin/users', requireAdmin, async (req, res) => {
@@ -904,10 +948,12 @@ api.get('/admin/rotation', requireAdmin, async (req, res) => {
   const m = Object.fromEntries(s.map((x) => [x.key, x.value]));
   const entries = (await q('SELECT id, key_version, meta_ct, secret_ct FROM entries')).rows;
   const users = (await q("SELECT id, public_key FROM users WHERE status = 'active'")).rows;
+  const doc = (await q('SELECT key_version, blob_ct, revision FROM billing_doc WHERE id = 1')).rows[0];
   await audit(req, 'rotation_prepare', { details: { entries: entries.length } });
   res.json({
     keyVersion: Number(m.key_version),
     revision: Number(m.vault_revision),
+    billing: doc ? { keyVersion: doc.key_version, blob: srvDec('billing-doc', doc.blob_ct), revision: doc.revision } : null,
     entries: entries.map((e) => ({
       id: e.id,
       keyVersion: e.key_version,
@@ -929,10 +975,20 @@ api.post('/admin/rotate', requireAdmin, async (req, res) => {
   if (!Array.isArray(b.entries) || !Array.isArray(b.wraps)) throw new HttpError(400, 'invalid');
   const entries = b.entries.map((e) => ({ id: v.uuid(e?.id), meta: v.blob(e?.meta, META_MAX, 'meta'), secret: v.blob(e?.secret, SECRET_MAX, 'secret') }));
   const wraps = b.wraps.map((w) => ({ userId: v.uuid(w?.userId, 'userId'), wrapped: v.wrap(w?.wrapped) }));
+  const billing = b.billing ? v.blob(b.billing, BILLING_MAX, 'billing') : null;
   let removedName = null;
   await tx(async (c) => {
     const vault = await lockVault(c);
     if (vault.keyVersion !== from || vault.revision !== revision) throw new HttpError(409, 'vault_changed');
+    // The billing document is re-encrypted with the new key too, and must not have changed meanwhile.
+    const doc = (await c.query('SELECT revision FROM billing_doc WHERE id = 1 FOR UPDATE')).rows[0];
+    if (doc && (!billing || b.billingRevision !== doc.revision)) throw new HttpError(409, 'vault_changed');
+    if (!doc && billing) throw new HttpError(409, 'vault_changed');
+    if (doc) {
+      await c.query('UPDATE billing_doc SET key_version = $1, blob_ct = $2, revision = revision + 1, updated_by = $3, updated_at = now() WHERE id = 1', [
+        to, srvEnc('billing-doc', billing), req.session.user_id,
+      ]);
+    }
     const ids = (await c.query('SELECT id FROM entries')).rows.map((r) => r.id).sort();
     const sent = entries.map((e) => e.id).sort();
     if (ids.length !== sent.length || ids.some((id, i) => id !== sent[i])) throw new HttpError(409, 'vault_changed');

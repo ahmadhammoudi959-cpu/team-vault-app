@@ -1,4 +1,5 @@
-// Read-only connections to Hostinger and Render, used for renewal reminders.
+// Read-only connections to Hostinger and Render: websites, domains, e-mail, subscriptions,
+// payment cards, services and databases, for alerts, the provider screens and the monthly report.
 // Tokens come only from the server's environment, are sent only to the two fixed API hosts,
 // only with GET requests, and are never logged or returned to the browser.
 import { domainToUnicode } from 'node:url';
@@ -62,11 +63,83 @@ function settle(result, errors, label) {
   return null;
 }
 
+const DAY = 86_400_000;
+const lower = (v) => str(v).toLowerCase();
+const cents = (n) => (Number.isFinite(n) ? Math.round(n) / 100 : null);
+const ms = (iso) => (iso ? Date.parse(iso) : NaN);
+
+// Paginated Hostinger lists answer { data, meta: { total } }; 25 per page is the documented default.
+async function hostingerPages(path, token) {
+  const out = [];
+  for (let page = 1; page <= 40 && out.length < MAX_ITEMS; page += 1) {
+    const body = await getJson(`${HOSTINGER_BASE}${path}?page=${page}`, token);
+    const items = listOf(body);
+    out.push(...items);
+    const total = Number(body && !Array.isArray(body) && body.meta ? body.meta.total : NaN);
+    if (!items.length || !Number.isFinite(total) || out.length >= total) break;
+  }
+  return out.slice(0, MAX_ITEMS);
+}
+
+// What a Hostinger subscription is, from its name (".DE Domain", "Starter Business Email", "Business Web Hosting"...).
+export function subscriptionKind(name) {
+  const n = lower(name);
+  if (/\bdomain\b/.test(n)) return 'domain';
+  if (/e-?mail/.test(n)) return 'email';
+  if (/monitor|\bssl\b|backup|\bcdn\b|security|protect/.test(n)) return 'addon';
+  if (/\bvps\b|\bkvm/.test(n)) return 'vps';
+  if (/host|cloud|\bweb\b|wordpress|website|builder|agency/.test(n)) return 'hosting';
+  return 'other';
+}
+
+// Hostinger reports both spellings in practice.
+export const LIVE_SUBSCRIPTION = new Set(['active', 'not_renewing', 'non_renewing', 'in_trial', 'paused']);
+
+// The date a subscription next costs money (auto-renewal) or ends (no auto-renewal).
+export const subscriptionDate = (s) => (s.autoRenew && s.nextBillingAt) || s.expiresAt || s.nextBillingAt || null;
+
+// Pairs items with subscriptions where the pairing is unambiguous: an item with a single
+// candidate takes it, unless another item also has only that candidate.
+function pairUnique(items, subs, fits) {
+  const pairs = new Map();
+  const taken = new Set();
+  for (let round = 0; round < 8; round += 1) {
+    const left = items.filter((it) => !pairs.has(it));
+    const cand = new Map(left.map((it) => [it, subs.filter((s) => !taken.has(s) && fits(it, s))]));
+    let changed = false;
+    for (const it of left) {
+      const c = cand.get(it);
+      if (c.length !== 1 || taken.has(c[0])) continue;
+      if (left.some((o) => o !== it && !pairs.has(o) && cand.get(o).length === 1 && cand.get(o)[0] === c[0])) continue;
+      pairs.set(it, c[0]);
+      taken.add(c[0]);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+  return pairs;
+}
+
+// Hostinger usually charges an auto-renewing domain or mailbox up to a month before it ends.
+const chargedFor = (end, s) => {
+  const a = ms(end);
+  const b = ms(subscriptionDate(s));
+  return Number.isFinite(a) && Number.isFinite(b) && b >= a - 31 * DAY && b <= a + 2 * DAY;
+};
+const tldOf = (name) => {
+  const m = /^\.([a-z0-9-]+)\s+domain/i.exec(name || '');
+  return m ? `.${m[1].toLowerCase()}` : null;
+};
+
 export async function hostingerSnapshot(token) {
   const errors = [];
-  const [d, s] = await Promise.allSettled([
+  const [d, s, w, o, m, p] = await Promise.allSettled([
     getJson(`${HOSTINGER_BASE}/api/domains/v1/portfolio`, token),
     getJson(`${HOSTINGER_BASE}/api/billing/v1/subscriptions`, token),
+    hostingerPages('/api/hosting/v1/websites', token),
+    hostingerPages('/api/hosting/v1/orders', token),
+    hostingerPages('/api/mail/v1/orders', token),
+    getJson(`${HOSTINGER_BASE}/api/billing/v1/payment-methods`, token),
   ]);
   const domains = listOf(settle(d, errors, 'domains')).slice(0, MAX_ITEMS).map((x) => ({
     id: str(x.id, 40),
@@ -76,44 +149,121 @@ export async function hostingerSnapshot(token) {
     expiresAt: date(x.expires_at),
     createdAt: date(x.created_at),
   }));
-  const cents = (n) => (Number.isFinite(n) ? Math.round(n) / 100 : null);
   const subscriptions = listOf(settle(s, errors, 'subscriptions')).slice(0, MAX_ITEMS).map((x) => ({
     id: str(x.id, 60),
     name: str(x.name),
+    kind: subscriptionKind(x.name),
     status: str(x.status, 40),
     autoRenew: x.is_auto_renewed === true,
     renewalPrice: cents(x.renewal_price),
     totalPrice: cents(x.total_price),
     currency: str(x.currency_code, 8),
     period: x.billing_period ? `${Number(x.billing_period)} ${str(x.billing_period_unit, 20)}` : '',
+    periodCount: Number(x.billing_period) || 0,
+    periodUnit: lower(x.billing_period_unit).replace(/s$/, ''),
+    createdAt: date(x.created_at),
     expiresAt: date(x.expires_at),
     nextBillingAt: date(x.next_billing_at),
   }));
-  // Subscriptions are named like ".COM Domain"; link each to its domain when that is unambiguous.
-  for (const sub of subscriptions) {
-    const m = /^\.([a-z0-9-]+)\s+domain$/i.exec(sub.name);
-    if (!m) continue;
-    const tld = `.${m[1].toLowerCase()}`;
-    const same = domains.filter((dm) => dm.name.toLowerCase().endsWith(tld));
-    let match = same.length === 1 ? same[0] : null;
-    if (!match && sub.expiresAt) {
-      const near = same.filter((dm) => dm.expiresAt && Math.abs(Date.parse(dm.expiresAt) - Date.parse(sub.expiresAt)) <= 2 * 86_400_000);
-      if (near.length === 1) match = near[0];
-    }
-    if (match) sub.domain = match.name;
+  const websites = (settle(w, errors, 'websites') || []).map((x) => ({
+    domain: domainName(x.domain),
+    type: str(x.website_type, 20),
+    enabled: x.is_enabled !== false,
+    username: str(x.username, 60),
+    orderId: x.order_id === null || x.order_id === undefined ? null : str(x.order_id, 40),
+    parentDomain: domainName(x.parent_domain),
+    createdAt: date(x.created_at),
+  }));
+  const hostingOrders = (settle(o, errors, 'hosting_orders') || []).map((x) => ({
+    id: str(x.id, 40),
+    subscriptionId: x.subscription_id ? str(x.subscription_id, 60) : null,
+    plan: str(x.plan && x.plan.name, 80),
+    status: str(x.status, 40),
+    createdAt: date(x.created_at),
+  }));
+  const mailOrders = (settle(m, errors, 'mail') || []).map((x) => ({
+    id: str(x.id, 60),
+    domain: domainName(x.domain && x.domain.name),
+    plan: str(x.plan && (x.plan.title || x.plan.name), 80),
+    status: str(x.status, 40),
+    trial: x.is_trial === true,
+    seats: Number(x.seats) || 0,
+    createdAt: date(x.created_at),
+    expiresAt: date(x.expires_at),
+  }));
+  const paymentMethods = listOf(settle(p, errors, 'payment_methods')).slice(0, 50).map((x) => ({
+    id: str(x.id, 40),
+    name: str(x.name, 60),
+    identifier: str(x.identifier, 80),
+    method: str(x.payment_method, 40),
+    isDefault: x.is_default === true,
+    expired: x.is_expired === true,
+    suspended: x.is_suspended === true,
+    expiresAt: date(x.expires_at),
+  }));
+  if (!d.value && !s.value) throw new IntegrationError(errors[0].split(':')[1]);
+
+  // Websites -> hosting order -> subscription (exact ids from Hostinger).
+  const subById = new Map(subscriptions.map((x) => [x.id, x]));
+  const orderById = new Map(hostingOrders.map((x) => [x.id, x]));
+  for (const ord of hostingOrders) {
+    const sub = ord.subscriptionId && subById.get(ord.subscriptionId);
+    if (sub && ord.plan) sub.plan = ord.plan;
   }
-  if (errors.length === 2) throw new IntegrationError(errors[0].split(':')[1]);
-  return { fetchedAt: new Date().toISOString(), domains, subscriptions, errors };
+  for (const site of websites) {
+    const ord = site.orderId && orderById.get(site.orderId);
+    if (!ord) continue;
+    site.plan = ord.plan;
+    const sub = ord.subscriptionId && subById.get(ord.subscriptionId);
+    if (!sub) continue;
+    site.subscriptionId = sub.id;
+    if (site.domain) (sub.websites ||= []).push(site.domain);
+  }
+
+  // Domains and mailboxes carry no subscription id, so they are matched by date (and TLD).
+  // Live subscriptions are matched first, so an old cancelled one never takes a domain from a live one.
+  const named = domains.filter((x) => x.name && x.expiresAt && !['deleted', 'failed'].includes(x.status));
+  const domainSubs = subscriptions.filter((x) => x.kind === 'domain');
+  const fitsDomain = (dm, sub) => {
+    const tld = tldOf(sub.name);
+    return (!tld || lower(dm.name).endsWith(tld)) && chargedFor(dm.expiresAt, sub);
+  };
+  const livePairs = pairUnique(named, domainSubs.filter((x) => LIVE_SUBSCRIPTION.has(x.status)), fitsDomain);
+  const restPairs = pairUnique(named.filter((x) => !livePairs.has(x)), domainSubs.filter((x) => !LIVE_SUBSCRIPTION.has(x.status)), fitsDomain);
+  for (const [dm, sub] of [...livePairs, ...restPairs]) {
+    sub.domain = dm.name;
+    dm.subscriptionId = sub.id;
+  }
+  // A TLD held by a single domain and a single subscription is the same thing.
+  for (const sub of domainSubs.filter((x) => !x.domain)) {
+    const tld = tldOf(sub.name);
+    if (!tld) continue;
+    const doms = [...new Set(domains.filter((x) => lower(x.name).endsWith(tld)).map((x) => x.name))];
+    const subsOfTld = domainSubs.filter((x) => tldOf(x.name) === tld);
+    if (doms.length !== 1 || subsOfTld.length !== 1 || domains.some((x) => x.name === doms[0] && x.subscriptionId)) continue;
+    sub.domain = doms[0];
+    for (const dm of domains) if (dm.name === doms[0]) dm.subscriptionId = sub.id;
+  }
+  const mailPairs = pairUnique(mailOrders.filter((x) => x.expiresAt), subscriptions.filter((x) => x.kind === 'email' && LIVE_SUBSCRIPTION.has(x.status)), (mo, sub) => chargedFor(mo.expiresAt, sub));
+  for (const [mo, sub] of mailPairs) {
+    sub.mailDomain = mo.domain;
+    mo.subscriptionId = sub.id;
+  }
+  for (const sub of subscriptions) {
+    const target = sub.domain || sub.mailDomain || (sub.websites && sub.websites.length ? `${sub.websites[0]}${sub.websites.length > 1 ? ` +${sub.websites.length - 1}` : ''}` : '');
+    sub.title = target ? `${target} (${sub.name})` : sub.name;
+  }
+  return { fetchedAt: new Date().toISOString(), domains, subscriptions, websites, hostingOrders, mailOrders, paymentMethods, errors };
 }
 
 async function renderList(path, token, key) {
   const out = [];
   let cursor = null;
   for (let page = 0; page < 10; page += 1) {
-    const url = `${RENDER_BASE}${path}?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+    const url = `${RENDER_BASE}${path}${path.includes('?') ? '&' : '?'}limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
     const body = await getJson(url, token);
     const items = Array.isArray(body) ? body : [];
-    for (const it of items) if (it && it[key]) out.push(it[key]);
+    for (const it of items) if (it && (it[key] || it.id)) out.push(it[key] || it);
     if (items.length < 100) break;
     cursor = items[items.length - 1].cursor;
     if (!cursor) break;
@@ -121,59 +271,133 @@ async function renderList(path, token, key) {
   return out;
 }
 
+// Runs fn over items, a few at a time.
+async function eachLimited(items, limit, fn) {
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) {
+      const it = items[i];
+      i += 1;
+      await fn(it);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
 export async function renderSnapshot(token) {
   const errors = [];
-  const [sv, pg] = await Promise.allSettled([renderList('/services', token, 'service'), renderList('/postgres', token, 'postgres')]);
-  const services = (settle(sv, errors, 'services') || []).slice(0, MAX_ITEMS).map((x) => ({
-    id: str(x.id, 60),
-    name: str(x.name),
-    type: str(x.type, 40),
-    suspended: x.suspended === 'suspended',
-    plan: str(x.serviceDetails && x.serviceDetails.plan, 40),
-    url: str(x.serviceDetails && x.serviceDetails.url, 300),
-    dashboardUrl: str(x.dashboardUrl, 300),
-    updatedAt: date(x.updatedAt),
-  }));
+  const keyValueList = () => renderList('/key-value', token, 'keyValue').catch((e) => {
+    if (e && e.code === 'http_404') return renderList('/redis', token, 'redis');
+    throw e;
+  });
+  const [sv, pg, kv, ow] = await Promise.allSettled([
+    renderList('/services', token, 'service'),
+    renderList('/postgres', token, 'postgres'),
+    keyValueList(),
+    renderList('/owners', token, 'owner'),
+  ]);
+  const services = (settle(sv, errors, 'services') || []).slice(0, MAX_ITEMS).map((x) => {
+    const det = x.serviceDetails || {};
+    return {
+      id: str(x.id, 60),
+      name: str(x.name),
+      type: str(x.type, 40),
+      suspended: x.suspended === 'suspended',
+      plan: str(det.plan, 40),
+      region: str(det.region || x.region, 40),
+      runtime: str(det.runtime || det.env, 40),
+      instances: Number(det.numInstances) || null,
+      url: str(det.url, 300),
+      repo: str(x.repo, 300),
+      branch: str(x.branch, 120),
+      ownerId: str(x.ownerId, 60),
+      dashboardUrl: str(x.dashboardUrl, 300),
+      createdAt: date(x.createdAt),
+      updatedAt: date(x.updatedAt),
+    };
+  });
   const databases = (settle(pg, errors, 'postgres') || []).slice(0, MAX_ITEMS).map((x) => ({
     id: str(x.id, 60),
     name: str(x.name),
     plan: str(x.plan, 40),
     status: str(x.status, 40),
     region: str(x.region, 40),
+    version: str(x.version, 10),
+    diskSizeGB: Number(x.diskSizeGB) || null,
     expiresAt: date(x.expiresAt),
     suspended: x.suspended === 'suspended',
+    ownerId: str((x.owner && x.owner.id) || x.ownerId, 60),
     dashboardUrl: str(x.dashboardUrl, 300),
     createdAt: date(x.createdAt),
   }));
-  if (errors.length === 2) throw new IntegrationError(errors[0].split(':')[1]);
-  return { fetchedAt: new Date().toISOString(), services, databases, errors };
+  const keyValues = (settle(kv, errors, 'key_value') || []).slice(0, MAX_ITEMS).map((x) => ({
+    id: str(x.id, 60),
+    name: str(x.name),
+    plan: str(x.plan, 40),
+    status: str(x.status, 40),
+    region: str(x.region, 40),
+    ownerId: str((x.owner && x.owner.id) || x.ownerId, 60),
+    dashboardUrl: str(x.dashboardUrl, 300),
+    createdAt: date(x.createdAt),
+  }));
+  const owners = (settle(ow, errors, 'owners') || []).slice(0, 50).map((x) => ({
+    id: str(x.id, 60),
+    name: str(x.name, 120),
+    email: str(x.email, 200),
+    type: str(x.type, 20),
+  }));
+  if (!sv.value && !pg.value) throw new IntegrationError(errors[0].split(':')[1]);
+  // Custom domains people reach each website on.
+  const withDomains = services.filter((x) => ['web_service', 'static_site'].includes(x.type)).slice(0, 60);
+  let domainError = null;
+  await eachLimited(withDomains, 4, async (svc) => {
+    try {
+      const list = await renderList(`/services/${encodeURIComponent(svc.id)}/custom-domains`, token, 'customDomain');
+      svc.customDomains = list.slice(0, 50).map((c) => ({ name: domainName(c.name), verified: c.verificationStatus === 'verified', type: str(c.domainType, 20) }));
+    } catch (e) {
+      domainError ||= (e && e.code) || 'failed';
+    }
+  });
+  if (domainError) errors.push(`custom_domains:${domainError}`);
+  return { fetchedAt: new Date().toISOString(), services, databases, keyValues, owners, errors };
 }
 
-const DAY = 86_400_000;
-// Hostinger reports both spellings in practice.
-export const LIVE_SUBSCRIPTION = new Set(['active', 'not_renewing', 'non_renewing', 'in_trial', 'paused']);
-
-// Items that end within `windowDays` (or already ended), for banners. Small and name-only.
+// Everything that ends, renews or needs attention within `windowDays` (or already did), for alerts.
 // Days are whole calendar days to the end date as the provider shows it (its UTC date):
 // a domain ending 2026-11-30T23:59:59Z is "9 days" on 2026-11-21, as in hPanel.
-export function upcoming({ hostinger, render }, windowDays = 30, now = Date.now()) {
+export function upcoming({ hostinger, render }, windowDays = 60, now = Date.now()) {
   const items = [];
-  const push = (title, at, source) => {
+  const push = (key, title, at, source, extra = {}) => {
     const t = Date.parse(at);
     if (!Number.isFinite(t)) return;
     const days = Math.floor(t / DAY) - Math.floor(now / DAY);
-    if (days <= windowDays) items.push({ title, at, source, days });
+    if (days <= windowDays) items.push({ key, title, at, source, days, ...extra });
   };
   if (hostinger && !hostinger.error) {
-    const subs = (hostinger.subscriptions || []).filter((s) => LIVE_SUBSCRIPTION.has(s.status));
-    const covered = new Set(subs.map((s) => s.domain).filter(Boolean));
-    for (const d of hostinger.domains || []) {
-      if (d.expiresAt && !covered.has(d.name) && !['deleted', 'failed', 'requested'].includes(d.status)) push(d.name, d.expiresAt, 'hostinger_domain');
+    const live = (hostinger.subscriptions || []).filter((x) => LIVE_SUBSCRIPTION.has(x.status));
+    const coveredDomains = new Set(live.filter((x) => x.domain).map((x) => x.domain));
+    const coveredMail = new Set(live.filter((x) => x.mailDomain).map((x) => x.mailDomain));
+    const seen = new Set();
+    for (const x of hostinger.domains || []) {
+      if (!x.expiresAt || coveredDomains.has(x.name) || seen.has(x.name) || ['deleted', 'failed', 'requested'].includes(x.status)) continue;
+      seen.add(x.name);
+      push(`hd:${x.name}`, x.name, x.expiresAt, 'hostinger_domain');
     }
-    for (const s of subs) push(s.domain ? `${s.domain} (${s.name})` : s.name, s.expiresAt || s.nextBillingAt, 'hostinger_subscription');
+    for (const x of live) {
+      push(`hs:${x.id}`, x.title || x.name, subscriptionDate(x), 'hostinger_subscription', { autoRenew: x.autoRenew, price: x.renewalPrice, currency: x.currency });
+    }
+    for (const x of hostinger.mailOrders || []) {
+      if (x.subscriptionId || coveredMail.has(x.domain) || x.status === 'suspended') continue;
+      push(`hm:${x.id}`, `${x.domain || 'E-mail'} (${x.plan || 'E-mail'})`, x.expiresAt, 'hostinger_mail');
+    }
+    for (const x of hostinger.paymentMethods || []) {
+      const title = [x.name, x.identifier].filter(Boolean).join(' ');
+      if (x.expired || x.suspended) push(`hp:${x.id}`, title, new Date(now).toISOString(), 'hostinger_card', { problem: x.expired ? 'expired' : 'suspended' });
+      else if (x.expiresAt) push(`hp:${x.id}`, title, x.expiresAt, 'hostinger_card', { isDefault: x.isDefault });
+    }
   }
   if (render && !render.error) {
-    for (const p of render.databases || []) if (p.expiresAt) push(p.name, p.expiresAt, 'render_database');
+    for (const p of render.databases || []) if (p.expiresAt) push(`rp:${p.id}`, p.name, p.expiresAt, 'render_database', { link: p.dashboardUrl || null });
   }
   return items.sort((a, b) => a.days - b.days);
 }

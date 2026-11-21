@@ -1,6 +1,7 @@
 import { h, icon, dial, button, field, setBusy, toast, modal, confirmDialog, num, relTime, fmtDate, countLabel } from './ui.js';
 import { api, ApiError, errorText, setSessionLostHandler } from './api.js';
 import * as vc from './vcrypto.js';
+import * as bl from './billing.js';
 
 const root = document.getElementById('app');
 
@@ -16,6 +17,11 @@ const S = {
   searchEl: null,
   resultsEl: null,
   bannerEl: null,
+  billing: null, // admins' billing document (decrypted) + edit counter
+  alerts: [],
+  seenMarks: new Set(), // alerts marked as seen in this session (a status fetched earlier may not know yet)
+  hub: null, // Hostinger/Render data for the subscriptions screens
+  reportMonth: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,7 +94,8 @@ const ACTIONS = {
   backup_export: 'تنزيل نسخة احتياطية',
   backup_import: 'استرجاع نسخة احتياطية',
   gate_rotate: 'تغيير رابط الدخول',
-  renewals_refresh: 'تحديث التجديدات من Hostinger و Render',
+  renewals_refresh: 'تحديث بيانات Hostinger و Render',
+  billing_update: 'تعديل العملاء والأسعار في الفواتير',
 };
 const ALARMING = new Set(['login_fail', 'login_while_locked', 'account_locked', 'login_device_blocked', 'reveal_limit_hit', 'device_block', 'member_remove', 'recovery_login', 'device_recovery_approved', 'entry_purge']);
 
@@ -685,6 +692,11 @@ function wipe() {
   S.users = {};
   S.query = '';
   S.status = null;
+  S.billing = null;
+  S.alerts = [];
+  S.seenMarks = new Set();
+  S.hub = null;
+  S.reportMonth = null;
   clearTimeout(clipTimer);
   clearClipboard();
 }
@@ -759,6 +771,13 @@ async function refreshStatus() {
     el.hidden = n === 0;
     el.textContent = n ? num(n) : '';
   });
+  try {
+    if (!S.billing) await loadBilling();
+    await computeAlerts();
+  } catch {
+    /* alerts come back on the next refresh */
+  }
+  updateBell();
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +796,7 @@ function topbar({ title, withSearch }) {
       S.user.role === 'admin'
         ? h('button', { type: 'button', class: 'btn btn-menu', onClick: () => showAdmin('team') }, icon('users', 18), h('span', null, 'الإدارة'), h('span', { class: 'badge', dataset: { badge: '' }, hidden: true }))
         : null,
-      S.user.role === 'admin' ? button('التجديدات والاشتراكات', { kind: 'menu', iconName: 'calendar', onClick: () => showAdmin('renewals') }) : null,
+      S.user.role === 'admin' ? button('الاشتراكات والفواتير', { kind: 'menu', iconName: 'calendar', onClick: () => showHub('alerts') }) : null,
       button('تسجيل الخروج', { kind: 'menu', iconName: 'logout', onClick: () => logout() }),
     ),
   );
@@ -814,6 +833,9 @@ function topbar({ title, withSearch }) {
       withSearch
         ? button('إضافة حساب', { kind: 'primary', iconName: 'plus', onClick: () => openEntryForm() })
         : button('رجوع للخزنة', { kind: 'primary', iconName: 'back', onClick: () => showVault() }),
+      S.user.role === 'admin'
+        ? h('button', { type: 'button', class: 'btn btn-ghost-light btn-icon bell', title: 'التنبيهات', 'aria-label': 'التنبيهات', onClick: () => showHub('alerts') }, icon('bell'), h('span', { class: 'badge', dataset: { bell: '' }, hidden: true }))
+        : null,
       button('', { kind: 'ghost-light', iconName: 'lock', title: 'قفل الخزنة الآن', onClick: () => lock(true) }),
       menu,
     ),
@@ -828,6 +850,7 @@ function showVault() {
   show(bar, h('main', { class: 'vault' }, S.bannerEl, S.resultsEl));
   renderResults();
   renderBanners();
+  updateBell();
   refreshStatus();
   if (window.matchMedia('(min-width: 760px)').matches) S.searchEl.focus();
 }
@@ -1257,7 +1280,7 @@ function renderBanners() {
     items.push(banner(
       soon[0].days <= 7 ? 'danger' : 'warn',
       [`${countLabel(soon.length, 'تجديد واحد', 'تجديدان', 'تجديدات', 'تجديدًا')} خلال 30 يومًا. الأقرب: «`, h('bdi', null, soon[0].title), `» ${daysText(soon[0].days)}.`],
-      ['عرض التجديدات', () => showAdmin('renewals')],
+      ['عرض التنبيهات', () => showHub('alerts')],
       'calendar',
     ));
   }
@@ -1366,7 +1389,6 @@ async function showAccount() {
 // ---------------------------------------------------------------------------
 const ADMIN_TABS = [
   ['team', 'الفريق', 'users'],
-  ['renewals', 'التجديدات', 'calendar'],
   ['devices', 'الأجهزة', 'device'],
   ['audit', 'سجل النشاط', 'list'],
   ['backup', 'النسخ الاحتياطي', 'download'],
@@ -1376,6 +1398,7 @@ const ADMIN_TABS = [
 
 function showAdmin(tab = 'team') {
   if (!S.user || S.user.role !== 'admin') return;
+  if (tab === 'renewals') return void showHub('alerts');
   S.searchEl = null;
   const panel = h('div', { class: 'admin-panel', role: 'tabpanel' });
   const nav = h(
@@ -1384,8 +1407,9 @@ function showAdmin(tab = 'team') {
     ADMIN_TABS.map(([id, label, ic]) => h('button', { type: 'button', role: 'tab', class: 'tab', 'aria-selected': String(id === tab), onClick: () => showAdmin(id) }, icon(ic, 18), h('span', null, label))),
   );
   show(topbar({ title: 'الإدارة', withSearch: false }), h('main', { class: 'admin' }, nav, panel));
+  updateBell();
   refreshStatus();
-  const render = { team: renderTeam, renewals: renderRenewals, devices: renderDevices, audit: renderAudit, backup: renderBackup, gate: renderGate, trash: renderTrash }[tab];
+  const render = { team: renderTeam, devices: renderDevices, audit: renderAudit, backup: renderBackup, gate: renderGate, trash: renderTrash }[tab];
   render(panel).catch((ex) => panel.replaceChildren(h('div', { class: 'empty' }, h('p', null, errorText(ex)))));
 }
 
@@ -1586,7 +1610,11 @@ async function rotateVault(removeUserId) {
     for (const u of d.users) {
       if (u.id !== removeUserId) wraps.push({ userId: u.id, wrapped: await vc.wrapVaultKey(raw, u.publicKey, u.id, newVersion) });
     }
-    await api.post('/admin/rotate', { fromVersion: d.keyVersion, newVersion, revision: d.revision, removeUserId, entries, wraps });
+    // The admins' billing document moves to the new key too.
+    let billing = null;
+    if (d.billing) billing = await vc.sealDoc(newKey, 'billing', newVersion, await vc.openDoc(S.keys.vaultKey, 'billing', d.billing.keyVersion, d.billing.blob));
+    await api.post('/admin/rotate', { fromVersion: d.keyVersion, newVersion, revision: d.revision, removeUserId, entries, wraps, billing, billingRevision: d.billing ? d.billing.revision : undefined });
+    S.billing = null;
     S.keys.vaultKey = newKey;
     S.keys.keyVersion = newVersion;
     S.keys.wrapped = wraps.find((w) => w.userId === S.user.id).wrapped;
@@ -1596,76 +1624,875 @@ async function rotateVault(removeUserId) {
   await loadEntries();
 }
 
-const RENEW_SOURCE = {
+// ---------------------------------------------------------------------------
+// subscriptions & invoices: alerts, the Hostinger and Render windows, the monthly report
+// ---------------------------------------------------------------------------
+const HOSTINGER_DOMAINS_URL = 'https://hpanel.hostinger.com/domains';
+const HOSTINGER_BILLING_URL = 'https://hpanel.hostinger.com/billing/subscriptions';
+const HOSTINGER_INVOICES_URL = 'https://hpanel.hostinger.com/billing/payment-history/paid';
+const HOSTINGER_CARDS_URL = 'https://hpanel.hostinger.com/billing/payment-methods';
+const HOSTINGER_EMAILS_URL = 'https://hpanel.hostinger.com/emails';
+const HOSTINGER_WEBSITES_URL = 'https://hpanel.hostinger.com/websites';
+const RENDER_BILLING_URL = 'https://dashboard.render.com/billing';
+const SUB_STATUS = { active: 'فعّال', not_renewing: 'لن يتجدد', non_renewing: 'لن يتجدد', cancelled: 'ملغي', paused: 'متوقف مؤقتًا', in_trial: 'تجريبي', transferred: 'منقول', future: 'لم يبدأ' };
+const SUB_KIND = { domain: 'دومين', email: 'إيميل', hosting: 'استضافة', vps: 'VPS', addon: 'خدمة إضافية', other: 'أخرى' };
+const DOMAIN_STATUS = { active: 'فعّال', expired: 'منتهي', pending_setup: 'قيد الإعداد', requested: 'مطلوب', pending_verification: 'بانتظار التحقق', deleted: 'محذوف', suspended: 'موقوف', failed: 'فشل' };
+const SITE_TYPE = { wordpress: 'WordPress', builder: 'Website Builder', horizons: 'Horizons', nodejs: 'Node.js', other: 'موقع' };
+const SERVICE_TYPE = { web_service: 'موقع / API', static_site: 'موقع ثابت', private_service: 'خدمة داخلية', background_worker: 'عامل خلفي', cron_job: 'مهمة مجدولة' };
+const ALERT_SOURCE = {
   entry: 'تاريخ مسجّل في الخزنة',
+  extra: 'تكلفة مضافة يدويًا',
   hostinger_domain: 'دومين على Hostinger',
   hostinger_subscription: 'اشتراك على Hostinger',
-  render_database: 'قاعدة بيانات على Render',
+  hostinger_mail: 'إيميل على Hostinger',
+  hostinger_card: 'بطاقة الدفع على Hostinger',
+  render_database: 'قاعدة بيانات مجانية على Render',
 };
-const HOSTINGER_DOMAINS_URL = 'https://hpanel.hostinger.com/domains';
-const LIVE_SUBSCRIPTION = new Set(['active', 'not_renewing', 'non_renewing', 'in_trial', 'paused']);
-const SUB_STATUS = { active: 'فعّال', not_renewing: 'لن يتجدد', non_renewing: 'لن يتجدد', cancelled: 'ملغي', paused: 'متوقف مؤقتًا', in_trial: 'تجريبي', transferred: 'منقول', future: 'لم يبدأ' };
-const DOMAIN_STATUS = { active: 'فعّال', expired: 'منتهي', pending_setup: 'قيد الإعداد', requested: 'مطلوب', pending_verification: 'بانتظار التحقق', deleted: 'محذوف', suspended: 'موقوف', failed: 'فشل' };
-const HOSTINGER_BILLING_URL = 'https://hpanel.hostinger.com/billing/subscriptions';
+const ALERT_GROUPS = [
+  ['due', 'منتهي أو مستحق اليوم'],
+  ['week', 'خلال أسبوع'],
+  ['month', 'خلال شهر'],
+  ['two_months', 'خلال شهرين'],
+];
+const PROVIDER_LABEL = { hostinger: 'Hostinger', render: 'Render', vault: 'الخزنة', other: 'أخرى' };
+const STATE_LABEL = { charged: 'تم الخصم', past: 'مضى موعده', auto: 'خصم تلقائي', manual: 'يحتاج تجديد يدوي', monthly: 'فاتورة شهرية', recurring: 'متكرر' };
+const CURRENCIES = ['EUR', 'USD', 'EGP', 'SAR', 'AED', 'KWD', 'QAR', 'JOD', 'TRY', 'GBP'];
+const PERIODS = [[1, 'شهريًا'], [3, 'كل 3 شهور'], [6, 'كل 6 شهور'], [12, 'سنويًا'], [24, 'كل سنتين'], [0, 'مرة واحدة']];
 const INTEGRATION_ERRORS = {
   auth: 'المفتاح (التوكن) غير صحيح أو انتهت صلاحيته. أنشئ مفتاحًا جديدًا وضعه في Render.',
   timeout: 'الخدمة لم ترد في الوقت المناسب. جرّب «تحديث» بعد قليل.',
   network: 'تعذّر الوصول للخدمة. جرّب «تحديث» بعد قليل.',
   rate_limited: 'طلبات كثيرة على الخدمة. جرّب بعد دقائق.',
+  http_404: 'غير متاح في هذا الحساب.',
 };
 const integrationError = (code) => INTEGRATION_ERRORS[code] || `تعذّر جلب البيانات (${code}).`;
 
-function renewalItems(d) {
-  const items = [];
-  for (const e of S.entries) {
-    if (e.meta.renewAt) items.push({ source: 'entry', title: `${e.meta.client}: ${platformName(e.meta)}${e.meta.label ? ` (${e.meta.label})` : ''}`, date: e.meta.renewAt, entry: e });
-  }
-  const h1 = d.hostinger && !d.hostinger.error && !d.hostinger.notConfigured ? d.hostinger : null;
-  const liveSubs = ((h1 && h1.subscriptions) || []).filter((x) => LIVE_SUBSCRIPTION.has(x.status));
-  const covered = new Set(liveSubs.map((x) => x.domain).filter(Boolean));
-  for (const x of (h1 && h1.domains) || []) {
-    if (x.expiresAt && !covered.has(x.name) && !['deleted', 'failed', 'requested'].includes(x.status)) items.push({ source: 'hostinger_domain', title: x.name, date: x.expiresAt, link: HOSTINGER_DOMAINS_URL, linkLabel: 'تجديد من Hostinger' });
-  }
-  for (const x of liveSubs) {
-    const when = x.expiresAt || x.nextBillingAt;
-    if (when) {
-      items.push({ source: 'hostinger_subscription', title: x.domain ? `${x.domain} (${x.name})` : x.name, date: when, autoRenew: x.autoRenew, price: x.renewalPrice, currency: x.currency, link: x.domain ? HOSTINGER_DOMAINS_URL : HOSTINGER_BILLING_URL, linkLabel: x.domain ? 'تجديد من Hostinger' : 'الاشتراكات على Hostinger' });
-    }
-  }
-  const r1 = d.render && !d.render.error && !d.render.notConfigured ? d.render : null;
-  for (const x of (r1 && r1.databases) || []) {
-    if (x.expiresAt) items.push({ source: 'render_database', title: x.name, date: x.expiresAt, link: x.dashboardUrl || null, linkLabel: 'فتح في Render' });
-  }
-  return items.map((x) => ({ ...x, days: daysUntil(x.date) })).sort((a, b) => (a.days ?? 1e9) - (b.days ?? 1e9));
+
+// An amount and its currency as one left-to-right unit (U+2066…U+2069), so Arabic text around
+// it can't reorder "250 USD + 15 EUR" into something unreadable.
+function money(v, cur) {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—';
+  const n = new Intl.NumberFormat('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(Number(v));
+  return `\u2066${n}${cur ? `\u00a0${cur}` : ''}\u2069`;
+}
+function periodText(count, unit) {
+  const m = bl.periodMonths(count, unit);
+  if (!m) return '';
+  if (m === 1) return 'شهريًا';
+  if (m === 12) return 'سنويًا';
+  if (m === 24) return 'كل سنتين';
+  if (m % 12 === 0) return `كل ${num(m / 12)} سنوات`;
+  return `كل ${num(m)} شهور`;
+}
+const moneyBag = (bag) => (Object.keys(bag).length ? Object.entries(bag).map(([c, v]) => money(v, c === '—' ? '' : c)).join(' + ') : '—');
+const extLink = (url, label, kind = 'secondary') => (url ? h('a', { class: `btn btn-${kind} btn-sm`, href: url, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, label)) : null);
+const monthName = (key) => new Intl.DateTimeFormat('ar-EG-u-nu-latn', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(bl.monthRange(key).start));
+const dayTag = (v) => {
+  const d = bl.daysFrom(v);
+  return d === null ? null : h('span', { class: `tag ${urgency(d)}` }, daysText(d));
+};
+
+// The vault's own dates and account details, for alerts and for guessing a domain's client.
+function vaultDates() {
+  return S.entries.map((e) => ({
+    id: e.id,
+    client: e.meta.client,
+    title: `${e.meta.client}: ${platformName(e.meta)}${e.meta.label ? ` (${e.meta.label})` : ''}`,
+    renewAt: e.meta.renewAt,
+    url: e.meta.url,
+    username: e.meta.username,
+    label: e.meta.label,
+    hosting: e.meta.hosting,
+  }));
 }
 
-function renewalRow(x) {
+// ---- the billing document (encrypted with the vault key, admins only) ----
+async function loadBilling() {
+  if (!S.user || S.user.role !== 'admin' || !S.keys) return null;
+  const r = await api.get('/admin/billing');
+  const doc = r.blob ? await vc.openDoc(S.keys.vaultKey, 'billing', r.keyVersion, r.blob) : bl.emptyDoc(vc.toB64(vc.randomBytes(32)));
+  doc.items = doc.items && typeof doc.items === 'object' ? doc.items : {};
+  doc.extras = Array.isArray(doc.extras) ? doc.extras : [];
+  doc.noticeSalt ||= vc.toB64(vc.randomBytes(32));
+  S.billing = { doc, revision: r.revision || 0, hmac: await vc.hmacKey(doc.noticeSalt) };
+  if (!r.blob) {
+    try {
+      await updateBilling(() => {});
+    } catch {
+      /* another admin created it first; it loads next time */
+    }
+  }
+  return S.billing;
+}
+
+// Applies a change to a fresh copy and saves it; if another admin saved first, retries on theirs.
+async function updateBilling(mutate) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!S.billing) await loadBilling();
+    const doc = structuredClone(S.billing.doc);
+    mutate(doc);
+    const blob = await vc.sealDoc(S.keys.vaultKey, 'billing', S.keys.keyVersion, doc);
+    try {
+      const r = await api.put('/admin/billing', { keyVersion: S.keys.keyVersion, blob, revision: S.billing.revision });
+      S.billing.doc = doc;
+      S.billing.revision = r.revision;
+      return;
+    } catch (ex) {
+      if (!(ex instanceof ApiError && ex.code === 'billing_changed') || attempt) throw ex;
+      S.billing = null;
+    }
+  }
+}
+
+const knownClients = () => [...new Set([
+  ...S.entries.map((e) => e.meta.client),
+  ...Object.values((S.billing && S.billing.doc.items) || {}).map((x) => x.client),
+  ...((S.billing && S.billing.doc.extras) || []).map((x) => x.client),
+].filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ar'));
+
+const noteFor = (key) => (S.billing && S.billing.doc.items[key]) || {};
+
+// ---- alerts (bell) ----
+async function computeAlerts() {
+  if (!S.status || !S.billing) return [];
+  const list = bl.alertItems({ renewals: S.status.renewals || [], entries: vaultDates(), extras: S.billing.doc.extras });
+  const seen = new Set([...(S.status.noticeReads || []), ...S.seenMarks]);
+  for (const x of list) {
+    x.mark = await vc.hmacHex(S.billing.hmac, bl.alertLabel(x));
+    x.read = seen.has(x.mark);
+    x.client ||= noteFor(x.key).client || '';
+  }
+  S.alerts = list;
+  return list;
+}
+
+function updateBell() {
+  const n = (S.alerts || []).filter((x) => !x.read).length;
+  document.querySelectorAll('[data-bell]').forEach((el) => {
+    el.hidden = n === 0;
+    el.textContent = n ? num(n) : '';
+  });
+}
+
+async function markSeen(list) {
+  const marks = list.filter((x) => !x.read).map((x) => x.mark);
+  for (let i = 0; i < marks.length; i += 500) await api.post('/admin/notices/read', { keys: marks.slice(i, i + 500) });
+  for (const m of marks) S.seenMarks.add(m);
+  for (const x of list) x.read = true;
+  for (const x of S.alerts || []) if (S.seenMarks.has(x.mark)) x.read = true;
+  updateBell();
+}
+
+// ---- the hub ----
+const HUB_TABS = [
+  ['alerts', 'التنبيهات', 'bell'],
+  ['hostinger', 'Hostinger', 'globe'],
+  ['render', 'Render', 'server'],
+  ['report', 'التقرير الشهري', 'chart'],
+];
+
+function showHub(tab = 'alerts') {
+  if (!S.user || S.user.role !== 'admin') return;
+  S.searchEl = null;
+  const panel = h('div', { class: 'admin-panel', role: 'tabpanel' });
+  const nav = h(
+    'nav',
+    { class: 'tabs no-print', role: 'tablist', 'aria-label': 'أقسام الاشتراكات والفواتير' },
+    HUB_TABS.map(([id, label, ic]) => h(
+      'button',
+      { type: 'button', role: 'tab', class: 'tab', 'aria-selected': String(id === tab), onClick: () => showHub(id) },
+      icon(ic, 18),
+      h('span', null, label),
+      id === 'alerts' ? h('span', { class: 'badge', dataset: { bell: '' }, hidden: true }) : null,
+    )),
+  );
+  show(topbar({ title: 'الاشتراكات والفواتير', withSearch: false }), h('main', { class: 'admin hub' }, nav, panel));
+  updateBell();
+  const draw = { alerts: renderAlerts, hostinger: renderHostingerTab, render: renderRenderTab, report: renderReport }[tab];
+  draw(panel).catch((ex) => panel.replaceChildren(h('div', { class: 'empty' }, h('p', null, errorText(ex)))));
+}
+
+// Provider data, cached for a minute in memory (the server caches it for 30 minutes).
+async function hubData(force = false) {
+  if (!force && S.hub && Date.now() - S.hub.at < 60_000) return S.hub.data;
+  const data = await api.get(force ? '/admin/renewals?refresh=1' : '/admin/renewals');
+  S.hub = { data, at: Date.now() };
+  return data;
+}
+
+function refreshButton(redraw) {
+  const b = button('تحديث الآن من Hostinger و Render', { kind: 'secondary', small: true, iconName: 'restore' });
+  b.addEventListener('click', async () => {
+    setBusy(b, true, 'جارٍ التحديث…');
+    try {
+      await hubData(true);
+      await refreshStatus();
+      toast('تم تحديث البيانات من Hostinger و Render.');
+      redraw();
+    } catch (ex) {
+      setBusy(b, false);
+      handleErr(ex);
+    }
+  });
+  return b;
+}
+
+// While the server is still fetching provider data, look again shortly.
+function pollWhileLoading(d, panel, redraw) {
+  if (!((d.hostinger && d.hostinger.loading) || (d.render && d.render.loading))) return;
+  setTimeout(async () => {
+    if (!panel.isConnected) return;
+    try {
+      S.hub = null;
+      await hubData();
+      redraw();
+    } catch {
+      /* keep the current view */
+    }
+  }, 4000);
+}
+
+async function ensureHubBasics() {
+  if (!S.status) await refreshStatus();
+  if (!S.billing) await loadBilling();
+}
+
+// ---- tab: alerts ----
+function alertLink(x) {
+  switch (x.source) {
+    case 'hostinger_domain':
+      return extLink(HOSTINGER_DOMAINS_URL, 'تجديد من Hostinger');
+    case 'hostinger_subscription':
+      return extLink(HOSTINGER_BILLING_URL, 'الاشتراك على Hostinger');
+    case 'hostinger_mail':
+      return extLink(HOSTINGER_EMAILS_URL, 'الإيميلات على Hostinger');
+    case 'hostinger_card':
+      return extLink(HOSTINGER_CARDS_URL, 'تحديث البطاقة');
+    case 'render_database':
+      return extLink(x.link || 'https://dashboard.render.com/', 'فتح في Render');
+    default:
+      return null;
+  }
+}
+
+function alertRow(x, redraw) {
   const extra = [];
-  if (x.autoRenew) extra.push('تجديد تلقائي مفعّل');
-  else if (x.source === 'hostinger_subscription') extra.push('التجديد التلقائي متوقف');
-  if (x.price) extra.push(`سعر التجديد ${num(x.price)} ${x.currency || ''}`.trim());
+  if (x.problem === 'expired') extra.push('البطاقة منتهية، حدّثها حتى لا يفشل أي تجديد');
+  else if (x.problem === 'suspended') extra.push('البطاقة موقوفة، حدّثها حتى لا يفشل أي تجديد');
+  else if (x.source === 'hostinger_card') extra.push(`تنتهي صلاحية البطاقة${x.isDefault ? ' الأساسية' : ''}، أضف بطاقة جديدة قبلها`);
+  if (x.source === 'hostinger_subscription') extra.push(x.autoRenew ? 'سيُخصم تلقائيًا' : 'التجديد التلقائي متوقف، يحتاج تجديد يدوي');
+  if (x.price) extra.push(money(x.price, x.currency));
+  if (x.client) extra.push(`العميل: ${x.client}`);
+  const seen = button(x.read ? 'تمت القراءة' : 'تعليم كمقروء', { kind: 'ghost', small: true, iconName: 'check' });
+  seen.disabled = x.read;
+  seen.addEventListener('click', async () => {
+    setBusy(seen, true);
+    try {
+      await markSeen([x]);
+      redraw();
+    } catch (ex) {
+      setBusy(seen, false);
+      handleErr(ex);
+    }
+  });
   return h(
     'li',
-    { class: 'person' },
-    h('div', { class: 'person-id' }, h('span', { class: `tag ${urgency(x.days)}` }, daysText(x.days)), h('strong', null, h('bdi', null, x.title))),
-    h('span', { class: 'muted stack-xs' }, h('span', null, `${RENEW_SOURCE[x.source]}: ${fmtDay(x.date)}`), extra.length ? h('span', null, extra.join('، ')) : null),
+    { class: `person alert-item${x.read ? ' is-read' : ''}` },
+    h('div', { class: 'person-id' }, x.read ? null : h('span', { class: 'dot', title: 'جديد' }), h('span', { class: `tag ${urgency(x.days)}` }, daysText(x.days)), h('strong', null, h('bdi', null, x.title))),
+    h('span', { class: 'muted stack-xs' }, h('span', null, `${ALERT_SOURCE[x.source] || ''}: ${fmtDay(x.day)}`), extra.length ? h('span', null, extra.join('، ')) : null),
     h(
       'div',
       { class: 'row-gap' },
-      x.link ? h('a', { class: 'btn btn-secondary btn-sm', href: x.link, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, x.linkLabel || 'فتح')) : null,
-      x.entry ? button('فتح في الخزنة', { kind: 'ghost', small: true, onClick: () => {
+      alertLink(x),
+      x.entryId ? button('فتح في الخزنة', { kind: 'ghost', small: true, onClick: () => {
         showVault();
-        setQuery(x.entry.meta.client);
+        setQuery(x.client || '');
       } }) : null,
+      seen,
     ),
   );
+}
+
+async function renderAlerts(panel) {
+  panel.replaceChildren(loading());
+  await ensureHubBasics();
+  await computeAlerts();
+  const draw = () => {
+    updateBell();
+    const list = S.alerts || [];
+    const unread = list.filter((x) => !x.read);
+    const all = button('تعليم الكل كمقروء', { kind: 'secondary', small: true, iconName: 'check' });
+    all.disabled = !unread.length;
+    all.addEventListener('click', async () => {
+      setBusy(all, true);
+      try {
+        await markSeen(list);
+        draw();
+      } catch (ex) {
+        setBusy(all, false);
+        handleErr(ex);
+      }
+    });
+    const pending = S.status && S.status.renewalsPending;
+    panel.replaceChildren(...[
+      section(
+        'التنبيهات',
+        h('p', { class: 'muted' }, 'لكل دومين وإيميل واستضافة واشتراك وبطاقة دفع: تنبيه قبل الموعد بشهرين، ثم قبله بشهر، ثم في الأسبوع الأخير، ثم يوم الاستحقاق. كل مرحلة جديدة تظهر كتنبيه جديد حتى لو قرأت السابق.'),
+        pending ? h('p', { class: 'muted loading' }, 'جارٍ جلب بيانات Hostinger و Render…') : null,
+        h('div', { class: 'row-gap' }, all, refreshButton(() => renderAlerts(panel))),
+      ),
+      ...ALERT_GROUPS.map(([stage, title]) => {
+        const items = list.filter((x) => x.stage === stage);
+        return items.length ? section(`${title} (${num(items.length)})`, h('ul', { class: 'people' }, items.map((x) => alertRow(x, draw)))) : null;
+      }),
+      list.length ? null : section('لا توجد تنبيهات', h('p', { class: 'muted' }, 'لا شيء ينتهي أو يُخصم خلال الشهرين القادمين.')),
+    ].filter(Boolean));
+    if (pending) {
+      setTimeout(async () => {
+        if (!panel.isConnected) return;
+        await refreshStatus();
+        await computeAlerts();
+        draw();
+      }, 5000);
+    }
+  };
+  draw();
+}
+
+// ---- assigning a charge to a client, with what we charge them ----
+function currencySelect(value) {
+  const list = [...new Set([value, ...CURRENCIES].filter(Boolean))];
+  return h('select', null, list.map((c) => h('option', { value: c, selected: c === value }, c)));
+}
+
+function clientInput(value) {
+  const id = `clients-${Math.random().toString(36).slice(2, 8)}`;
+  const input = textInput(value || '', { list: id, autocomplete: 'off', maxlength: 80, placeholder: 'اسم العميل كما في الخزنة' });
+  return h('div', null, input, h('datalist', { id }, knownClients().map((c) => h('option', { value: c }))));
+}
+
+const readNumber = (input) => {
+  const t = input.value.trim().replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))).replace(',', '.');
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isFinite(n) && n >= 0 && n < 1e8 ? Math.round(n * 100) / 100 : NaN;
+};
+
+function editCharge({ key, title, cost = null, currency = '', guessed = '' }, after) {
+  const cur = noteFor(key);
+  const clientBox = clientInput(cur.client || guessed || '');
+  const client = clientBox.querySelector('input');
+  const sell = ltrInput(cur.sell ?? '', { inputmode: 'decimal', placeholder: '0' });
+  const sellCur = currencySelect(cur.sellCurrency || currency || 'EUR');
+  const costIn = ltrInput(cur.cost ?? '', { inputmode: 'decimal', placeholder: cost === null ? '' : String(cost) });
+  const costCur = currencySelect(cur.costCurrency || currency || 'USD');
+  const note = textInput(cur.note || '', { maxlength: 200 });
+  const err = formError();
+  const save = button('حفظ', { kind: 'primary', type: 'submit' });
+  const form = h(
+    'form',
+    { class: 'stack', novalidate: true },
+    h('p', { class: 'muted' }, h('bdi', null, title)),
+    field('العميل', clientBox, guessed && !cur.client ? 'اقتراح من حسابات العميل في الخزنة، عدّله إن لزم.' : 'اختر عميلًا من الخزنة أو اكتب اسمًا جديدًا.'),
+    h('div', { class: 'grid-2' }, field('المطلوب من العميل', sell, 'المبلغ الذي ستطلبه من العميل مقابل هذا البند.'), field('العملة', sellCur)),
+    h('div', { class: 'grid-2' }, field('التكلفة علينا (اختياري)', costIn, cost === null ? 'السعر غير معروف من المزوّد، اكتبه هنا.' : `اتركه فارغًا لاستخدام سعر المزوّد (${money(cost, currency)}).`), field('عملة التكلفة', costCur)),
+    field('ملاحظة (اختياري)', note),
+    err,
+  );
+  const m = modal({ title: 'العميل والسعر', body: form, footer: [save, button('إلغاء', { kind: 'secondary', onClick: () => m.close() })] });
+  save.addEventListener('click', () => form.requestSubmit());
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.textContent = '';
+    const s1 = readNumber(sell);
+    const c1 = readNumber(costIn);
+    if (Number.isNaN(s1) || Number.isNaN(c1)) return void (err.textContent = 'اكتب المبالغ أرقامًا فقط، مثلًا 25 أو 12.5');
+    const item = {};
+    if (client.value.trim()) item.client = client.value.trim().slice(0, 80);
+    if (s1 !== null) {
+      item.sell = s1;
+      item.sellCurrency = sellCur.value;
+    }
+    if (c1 !== null) {
+      item.cost = c1;
+      item.costCurrency = costCur.value;
+    }
+    if (note.value.trim()) item.note = note.value.trim().slice(0, 200);
+    setBusy(save, true, 'جارٍ الحفظ…');
+    try {
+      await updateBilling((doc) => {
+        if (Object.keys(item).length) doc.items[key] = item;
+        else delete doc.items[key];
+      });
+      m.close();
+      toast('تم حفظ العميل والسعر.');
+      after();
+    } catch (ex) {
+      setBusy(save, false);
+      handleErr(ex);
+    }
+  });
+  client.focus();
+}
+
+function clientLine(key, guessed) {
+  const n = noteFor(key);
+  const parts = [];
+  if (n.client) parts.push(`العميل: ${n.client}`);
+  else if (guessed) parts.push(`العميل (اقتراح): ${guessed}`);
+  if (n.sell !== undefined) parts.push(`نطلب منه ${money(n.sell, n.sellCurrency)}`);
+  return parts.length ? h('span', null, parts.join('، ')) : null;
+}
+
+function assignButton(spec, after) {
+  return button(noteFor(spec.key).client ? 'تعديل العميل والسعر' : 'ربط بعميل', { kind: 'ghost', small: true, iconName: 'user', onClick: () => editCharge(spec, after) });
+}
+
+function listBlock(title, rows, open = false) {
+  return h('details', { class: 'tech', open }, h('summary', null, title), rows.length ? h('ul', { class: 'people' }, rows) : h('p', { class: 'muted' }, 'لا يوجد شيء.'));
+}
+
+function stat(label, value, tone = '') {
+  return h('div', { class: `stat${tone ? ` stat-${tone}` : ''}` }, h('b', null, value), h('span', null, label));
+}
+
+function partErrors(errors, names) {
+  const bad = (errors || []).map((e) => e.split(':')).filter(([k]) => names[k]);
+  return bad.length ? h('p', { class: 'muted' }, `تعذّر جلب: ${bad.map(([k, c]) => `${names[k]} (${integrationError(c)})`).join('، ')}`) : null;
+}
+
+// ---- tab: Hostinger ----
+async function renderHostingerTab(panel) {
+  panel.replaceChildren(loading());
+  await ensureHubBasics();
+  const d = await hubData();
+  const redraw = () => renderHostingerTab(panel);
+  const x = d.hostinger;
+  if (!x || x.notConfigured) return void panel.replaceChildren(section('Hostinger', connectGuide('hostinger')));
+  if (x.loading) {
+    panel.replaceChildren(section('Hostinger', h('p', { class: 'muted loading' }, 'جارٍ جلب البيانات من Hostinger…')));
+    return void pollWhileLoading(d, panel, redraw);
+  }
+  if (x.error) return void panel.replaceChildren(section('Hostinger', h('p', { class: 'form-error' }, integrationError(x.error)), h('div', { class: 'row-gap' }, refreshButton(redraw))));
+
+  const entries = vaultDates();
+  const subs = x.subscriptions || [];
+  const subById = new Map(subs.map((s) => [s.id, s]));
+  const subLine = (sub) => {
+    if (!sub) return null;
+    const when = bl.subDate(sub);
+    const bits = [`${sub.autoRenew ? 'يُخصم تلقائيًا' : 'تجديد يدوي'} ${when ? fmtDay(when) : ''}`.trim()];
+    if (sub.renewalPrice !== null) bits.push(money(sub.renewalPrice, sub.currency));
+    return h('span', null, bits.join(' — '));
+  };
+  const spec = (s) => ({ key: `hs:${s.id}`, title: s.title || s.name, cost: s.renewalPrice, currency: s.currency, guessed: bl.guessClient(bl.domainOf(s), entries) || '' });
+
+  // Websites
+  const siteRows = (x.websites || []).map((w) => {
+    const sub = w.subscriptionId && subById.get(w.subscriptionId);
+    return h(
+      'li',
+      { class: 'person' },
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, w.domain || '(بدون دومين)')), h('span', { class: 'tag' }, SITE_TYPE[w.type] || w.type || 'موقع'), w.enabled ? null : h('span', { class: 'tag tag-danger' }, 'موقوف')),
+      h('span', { class: 'muted stack-xs' }, h('span', null, `الخطة: ${w.plan || '—'}`), subLine(sub), sub ? clientLine(`hs:${sub.id}`, bl.guessClient(w.domain, entries)) : null),
+      h('div', { class: 'row-gap' }, sub ? dayTag(bl.subDate(sub)) : null, sub ? assignButton(spec(sub), redraw) : null),
+    );
+  });
+
+  // Domains (one row per name; the copy with an end date wins)
+  const byName = new Map();
+  for (const dm of x.domains || []) {
+    const prev = byName.get(dm.name);
+    if (!prev || (!prev.expiresAt && dm.expiresAt)) byName.set(dm.name, dm);
+  }
+  const domains = [...byName.values()].sort((a, b) => (Date.parse(a.expiresAt) || Infinity) - (Date.parse(b.expiresAt) || Infinity));
+  const domainRows = domains.map((dm) => {
+    const sub = dm.subscriptionId && subById.get(dm.subscriptionId);
+    return h(
+      'li',
+      { class: 'person' },
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, dm.name || '—')), h('span', { class: `tag${dm.status === 'expired' ? ' tag-danger' : ''}` }, DOMAIN_STATUS[dm.status] || dm.status)),
+      h('span', { class: 'muted stack-xs' }, h('span', null, dm.expiresAt ? `ينتهي ${fmtDay(dm.expiresAt)}` : 'بدون تاريخ انتهاء'), subLine(sub), sub ? clientLine(`hs:${sub.id}`, bl.guessClient(dm.name, entries)) : null),
+      h('div', { class: 'row-gap' }, dm.expiresAt ? dayTag(dm.expiresAt) : null, sub ? assignButton(spec(sub), redraw) : null),
+    );
+  });
+
+  // E-mail
+  const mailRows = (x.mailOrders || []).map((mo) => {
+    const sub = mo.subscriptionId && subById.get(mo.subscriptionId);
+    return h(
+      'li',
+      { class: 'person' },
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, mo.domain || '—')), h('span', { class: 'tag' }, mo.plan || 'E-mail'), mo.trial ? h('span', { class: 'tag tag-warn' }, 'تجريبي') : null, mo.status === 'suspended' ? h('span', { class: 'tag tag-danger' }, 'موقوف') : null),
+      h('span', { class: 'muted stack-xs' }, h('span', null, `${countLabel(mo.seats || 0, 'صندوق بريد واحد', 'صندوقان', 'صناديق بريد', 'صندوق بريد')}${mo.expiresAt ? ` — ينتهي ${fmtDay(mo.expiresAt)}` : ''}`), subLine(sub), sub ? clientLine(`hs:${sub.id}`, bl.guessClient(mo.domain, entries)) : null),
+      h('div', { class: 'row-gap' }, mo.expiresAt ? dayTag(mo.expiresAt) : null, sub ? assignButton(spec(sub), redraw) : null),
+    );
+  });
+
+  // Subscriptions (everything Hostinger charges for)
+  const subRows = subs
+    .slice()
+    .sort((a, b) => (Date.parse(bl.subDate(a)) || Infinity) - (Date.parse(bl.subDate(b)) || Infinity))
+    .map((s) => {
+      const when = bl.subDate(s);
+      const live = bl.LIVE.has(s.status);
+      return h(
+        'li',
+        { class: 'person' },
+        h(
+          'div',
+          { class: 'person-id' },
+          h('strong', null, h('bdi', null, s.title || s.name)),
+          h('span', { class: 'tag' }, SUB_KIND[s.kind] || s.kind),
+          h('span', { class: `tag${['non_renewing', 'not_renewing', 'cancelled'].includes(s.status) ? ' tag-warn' : ''}` }, SUB_STATUS[s.status] || s.status),
+          s.autoRenew && live ? h('span', { class: 'tag tag-admin' }, 'تجديد تلقائي') : null,
+        ),
+        h(
+          'span',
+          { class: 'muted stack-xs' },
+          h('span', null, `${when ? `${s.autoRenew && live ? 'الخصم القادم' : 'ينتهي'} ${fmtDay(when)}` : '—'}${s.renewalPrice !== null ? ` — ${money(s.renewalPrice, s.currency)}` : ''}${periodText(s.periodCount, s.periodUnit) ? ` ${periodText(s.periodCount, s.periodUnit)}` : ''}`),
+          clientLine(`hs:${s.id}`, bl.guessClient(bl.domainOf(s), entries)),
+        ),
+        h('div', { class: 'row-gap' }, live && when ? dayTag(when) : null, assignButton(spec(s), redraw)),
+      );
+    });
+
+  // Payment cards
+  const cardRows = (x.paymentMethods || []).map((c) => h(
+    'li',
+    { class: 'person' },
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, [c.name, c.identifier].filter(Boolean).join(' '))), c.isDefault ? h('span', { class: 'tag tag-admin' }, 'الأساسية') : null, c.expired ? h('span', { class: 'tag tag-danger' }, 'منتهية') : null, c.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
+    h('span', { class: 'muted' }, c.expiresAt ? `تنتهي ${fmtDay(c.expiresAt)}` : '—'),
+    c.expiresAt && !c.expired ? dayTag(c.expiresAt) : h('span'),
+  ));
+
+  const in30 = subs.filter((s) => s.autoRenew && bl.LIVE.has(s.status) && s.nextBillingAt && (bl.daysFrom(s.nextBillingAt) ?? 99) <= 30 && bl.daysFrom(s.nextBillingAt) >= 0);
+  const due30 = {};
+  for (const s of in30) if (s.renewalPrice) due30[s.currency || '—'] = Math.round(((due30[s.currency || '—'] || 0) + s.renewalPrice) * 100) / 100;
+  const manualSoon = subs.filter((s) => !s.autoRenew && bl.LIVE.has(s.status) && s.expiresAt && (bl.daysFrom(s.expiresAt) ?? 99) <= 60).length;
+  const cardIssue = (x.paymentMethods || []).some((c) => c.expired || c.suspended || ((bl.daysFrom(c.expiresAt) ?? 999) <= 60));
+
+  panel.replaceChildren(
+    section(
+      'Hostinger',
+      h('p', { class: 'muted' }, `آخر تحديث ${relTime(x.fetchedAt)}${x.lastError ? ` (آخر محاولة فشلت: ${integrationError(x.lastError)})` : ''}`),
+      h(
+        'div',
+        { class: 'stats' },
+        stat('المواقع', num(siteRows.length)),
+        stat('الدومينات', num(domainRows.length)),
+        stat('الإيميلات', num(mailRows.length)),
+        stat('الاشتراكات', num(subRows.length)),
+        stat('يُخصم تلقائيًا خلال 30 يومًا', moneyBag(due30)),
+        stat('تحتاج تجديد يدوي خلال شهرين', num(manualSoon), manualSoon ? 'warn' : ''),
+      ),
+      cardIssue ? h('p', { class: 'banner banner-warn' }, icon('card', 18), h('span', null, 'بطاقة الدفع على Hostinger منتهية أو تنتهي قريبًا. أضف بطاقة جديدة حتى لا يفشل أي تجديد تلقائي.')) : null,
+      partErrors(x.errors, { websites: 'المواقع', hosting_orders: 'خطط الاستضافة', mail: 'الإيميلات', payment_methods: 'بطاقات الدفع', domains: 'الدومينات', subscriptions: 'الاشتراكات' }),
+      h(
+        'div',
+        { class: 'row-gap' },
+        refreshButton(redraw),
+        extLink(HOSTINGER_INVOICES_URL, 'الفواتير (PDF) في hPanel'),
+        extLink(HOSTINGER_BILLING_URL, 'الاشتراكات في hPanel'),
+      ),
+    ),
+    section('المواقع', h('p', { class: 'muted' }, 'كل المواقع على الاستضافة، مع خطة كل موقع وموعد تجديدها.'), listBlock(`المواقع (${num(siteRows.length)})`, siteRows, true)),
+    section('الدومينات', listBlock(`الدومينات (${num(domainRows.length)})`, domainRows, true)),
+    section('الإيميلات', listBlock(`الإيميلات (${num(mailRows.length)})`, mailRows, true)),
+    section('الاشتراكات والمدفوعات', h('p', { class: 'muted' }, 'كل ما يُدفع لـ Hostinger. اربط كل اشتراك بعميله والمبلغ الذي تطلبه منه، ليظهر في التقرير الشهري.'), listBlock(`الاشتراكات (${num(subRows.length)})`, subRows, true)),
+    section('بطاقات الدفع', listBlock(`البطاقات (${num(cardRows.length)})`, cardRows, true), h('div', { class: 'row-gap' }, extLink(HOSTINGER_CARDS_URL, 'إدارة البطاقات في hPanel'))),
+  );
+}
+
+// ---- tab: Render ----
+async function renderRenderTab(panel) {
+  panel.replaceChildren(loading());
+  await ensureHubBasics();
+  const d = await hubData();
+  const redraw = () => renderRenderTab(panel);
+  const x = d.render;
+  if (!x || x.notConfigured) return void panel.replaceChildren(section('Render', connectGuide('render')));
+  if (x.loading) {
+    panel.replaceChildren(section('Render', h('p', { class: 'muted loading' }, 'جارٍ جلب البيانات من Render…')));
+    return void pollWhileLoading(d, panel, redraw);
+  }
+  if (x.error) return void panel.replaceChildren(section('Render', h('p', { class: 'form-error' }, integrationError(x.error)), h('div', { class: 'row-gap' }, refreshButton(redraw))));
+
+  const entries = vaultDates();
+  const owners = new Map((x.owners || []).map((o) => [o.id, o.name]));
+  const priceTag = (p, plan) => h('span', { class: `tag${plan === 'free' ? ' tag-warn' : ''}` }, `${plan || '—'}${p === null ? '' : p === 0 ? ' — مجاني' : ` — ${money(p, 'USD')} شهريًا`}`);
+  let total = 0;
+  let unknown = 0;
+  const count = (p, suspended) => {
+    if (suspended) return;
+    if (p === null) unknown += 1;
+    else total += p;
+  };
+
+  const svcRows = (x.services || []).map((s) => {
+    const p = s.type === 'static_site' ? 0 : s.type === 'cron_job' ? null : bl.renderPrice('service', s.plan);
+    count(p, s.suspended);
+    const domains = (s.customDomains || []).map((c) => `${c.name}${c.verified ? '' : ' (غير مؤكد)'}`);
+    const key = `rs:${s.id}`;
+    const guess = bl.guessClient(s.customDomains && s.customDomains[0] && s.customDomains[0].name, entries);
+    return h(
+      'li',
+      { class: 'person' },
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, s.name)), h('span', { class: 'tag' }, SERVICE_TYPE[s.type] || s.type), priceTag(p, s.type === 'static_site' ? 'static' : s.plan), s.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
+      h(
+        'span',
+        { class: 'muted stack-xs' },
+        h('bdi', { class: 'mono ip', dir: 'ltr' }, s.url || ''),
+        domains.length ? h('span', null, 'الدومينات: ', h('bdi', { dir: 'ltr' }, domains.join(', '))) : null,
+        h('span', null, [s.region, s.runtime, owners.get(s.ownerId)].filter(Boolean).join(' — ')),
+        clientLine(key, guess),
+      ),
+      h('div', { class: 'row-gap' }, extLink(s.dashboardUrl, 'فتح', 'ghost'), assignButton({ key, title: s.name, cost: p, currency: 'USD', guessed: guess || '' }, redraw)),
+    );
+  });
+  const dbRows = (x.databases || []).map((db) => {
+    const p = bl.renderPrice('postgres', db.plan, db.diskSizeGB);
+    count(p, db.suspended);
+    const key = `rp:${db.id}`;
+    return h(
+      'li',
+      { class: 'person' },
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, db.name)), priceTag(p, db.plan), db.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
+      h(
+        'span',
+        { class: 'muted stack-xs' },
+        h('span', null, db.expiresAt ? `المجانية تنتهي ${fmtDay(db.expiresAt)}، ثم تُحذف بعد 14 يومًا إن لم تُرقَّ` : 'لا تنتهي'),
+        h('span', null, [db.region, db.version ? `Postgres ${db.version}` : '', db.diskSizeGB ? `${num(db.diskSizeGB)} GB` : '', owners.get(db.ownerId)].filter(Boolean).join(' — ')),
+        clientLine(key, ''),
+      ),
+      h('div', { class: 'row-gap' }, db.expiresAt ? dayTag(db.expiresAt) : null, extLink(db.dashboardUrl, 'فتح', 'ghost'), assignButton({ key, title: db.name, cost: p, currency: 'USD' }, redraw)),
+    );
+  });
+  const kvRows = (x.keyValues || []).map((k) => {
+    const p = bl.renderPrice('keyValue', k.plan);
+    count(p, false);
+    const key = `rk:${k.id}`;
+    return h(
+      'li',
+      { class: 'person' },
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, k.name)), priceTag(p, k.plan)),
+      h('span', { class: 'muted stack-xs' }, h('span', null, [k.region, k.status, owners.get(k.ownerId)].filter(Boolean).join(' — ')), clientLine(key, '')),
+      h('div', { class: 'row-gap' }, extLink(k.dashboardUrl, 'فتح', 'ghost'), assignButton({ key, title: k.name, cost: p, currency: 'USD' }, redraw)),
+    );
+  });
+  const freeEnding = (x.databases || []).filter((db) => db.expiresAt).length;
+  const suspended = (x.services || []).filter((s) => s.suspended).length;
+
+  panel.replaceChildren(
+    section(
+      'Render',
+      h('p', { class: 'muted' }, `آخر تحديث ${relTime(x.fetchedAt)}${owners.size ? ` — مساحات العمل: ${[...owners.values()].join('، ')}` : ''}`),
+      h(
+        'div',
+        { class: 'stats' },
+        stat('الخدمات', num(svcRows.length)),
+        stat('قواعد البيانات', num(dbRows.length)),
+        stat('Key Value', num(kvRows.length)),
+        stat('التكلفة الشهرية التقديرية', `${money(Math.round(total * 100) / 100, 'USD')}${unknown ? ` + ${num(unknown)} غير معروف` : ''}`),
+        stat('قواعد بيانات مجانية ستنتهي', num(freeEnding), freeEnding ? 'warn' : ''),
+        stat('خدمات موقوفة', num(suspended), suspended ? 'warn' : ''),
+      ),
+      h('p', { class: 'muted' }, 'التكلفة التقديرية من أسعار Render المنشورة لكل خطة، ولا تشمل خطة مساحة العمل والاستهلاك الإضافي. Render لا يتيح الفواتير عبر الـ API، والفاتورة الرسمية (PDF) تجدها في صفحة الفواتير.'),
+      partErrors(x.errors, { key_value: 'Key Value', owners: 'مساحات العمل', custom_domains: 'الدومينات المربوطة', postgres: 'قواعد البيانات', services: 'الخدمات' }),
+      h('div', { class: 'row-gap' }, refreshButton(redraw), extLink(RENDER_BILLING_URL, 'الفواتير (PDF) في Render')),
+    ),
+    section('الخدمات', listBlock(`الخدمات (${num(svcRows.length)})`, svcRows, true)),
+    section('قواعد البيانات', listBlock(`Postgres (${num(dbRows.length)})`, dbRows, true), kvRows.length ? listBlock(`Key Value (${num(kvRows.length)})`, kvRows, true) : null),
+  );
+}
+
+// ---- tab: monthly report ----
+function editExtra(existing, after) {
+  const x = existing || { id: vc.uuid(), periodMonths: 1, currency: 'USD', sellCurrency: 'EUR', start: new Date().toISOString().slice(0, 10) };
+  const title = textInput(x.title || '', { maxlength: 100, placeholder: 'مثلًا: Google Workspace، باقة إعلانات، استضافة عند شركة أخرى' });
+  const provider = textInput(x.provider || '', { maxlength: 60, placeholder: 'اسم الشركة' });
+  const clientBox = clientInput(x.client || '');
+  const cost = ltrInput(x.cost ?? '', { inputmode: 'decimal', placeholder: '0' });
+  const costCur = currencySelect(x.currency || 'USD');
+  const sell = ltrInput(x.sell ?? '', { inputmode: 'decimal', placeholder: '0' });
+  const sellCur = currencySelect(x.sellCurrency || x.currency || 'EUR');
+  const period = h('select', null, PERIODS.map(([v, l]) => h('option', { value: String(v), selected: Number(x.periodMonths || 0) === v }, l)));
+  const start = h('input', { type: 'date', value: x.start || '' });
+  const note = textInput(x.note || '', { maxlength: 200 });
+  const err = formError();
+  const save = button('حفظ', { kind: 'primary', type: 'submit' });
+  const del = existing ? button('حذف البند', { kind: 'danger-ghost' }) : null;
+  const form = h(
+    'form',
+    { class: 'stack', novalidate: true },
+    h('p', { class: 'muted' }, 'لأي تكلفة ليست على Hostinger أو Render. تظهر في التقرير الشهري وفي التنبيهات قبل موعدها.'),
+    field('البند', title),
+    h('div', { class: 'grid-2' }, field('الشركة', provider), field('العميل', clientBox)),
+    h('div', { class: 'grid-2' }, field('التكلفة علينا', cost), field('العملة', costCur)),
+    h('div', { class: 'grid-2' }, field('المطلوب من العميل', sell), field('العملة', sellCur)),
+    h('div', { class: 'grid-2' }, field('يتكرر', period), field('أول موعد', start)),
+    field('ملاحظة (اختياري)', note),
+    err,
+  );
+  const m = modal({ title: existing ? 'تعديل بند' : 'إضافة بند', body: form, footer: [save, del, button('إلغاء', { kind: 'secondary', onClick: () => m.close() })] });
+  save.addEventListener('click', () => form.requestSubmit());
+  if (del) {
+    del.addEventListener('click', async () => {
+      if (!(await confirmDialog({ title: 'حذف البند', text: `سيُحذف «${x.title}» من التقارير والتنبيهات.`, confirmLabel: 'حذف', danger: true }))) return;
+      try {
+        await updateBilling((doc) => {
+          doc.extras = doc.extras.filter((e) => e.id !== x.id);
+        });
+        m.close();
+        toast('تم حذف البند.');
+        after();
+      } catch (ex) {
+        handleErr(ex);
+      }
+    });
+  }
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.textContent = '';
+    const c1 = readNumber(cost);
+    const s1 = readNumber(sell);
+    if (!title.value.trim()) return void (err.textContent = 'اكتب اسم البند.');
+    if (Number.isNaN(c1) || Number.isNaN(s1)) return void (err.textContent = 'اكتب المبالغ أرقامًا فقط، مثلًا 25 أو 12.5');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start.value)) return void (err.textContent = 'اختر أول موعد.');
+    const item = {
+      id: x.id,
+      title: title.value.trim().slice(0, 100),
+      provider: provider.value.trim().slice(0, 60),
+      client: clientBox.querySelector('input').value.trim().slice(0, 80),
+      cost: c1,
+      currency: costCur.value,
+      sell: s1,
+      sellCurrency: sellCur.value,
+      periodMonths: Number(period.value) || 0,
+      start: start.value,
+      note: note.value.trim().slice(0, 200),
+    };
+    setBusy(save, true, 'جارٍ الحفظ…');
+    try {
+      await updateBilling((doc) => {
+        const i = doc.extras.findIndex((e) => e.id === item.id);
+        if (i >= 0) doc.extras[i] = item;
+        else doc.extras.push(item);
+      });
+      m.close();
+      toast('تم حفظ البند.');
+      after();
+    } catch (ex) {
+      setBusy(save, false);
+      handleErr(ex);
+    }
+  });
+  title.focus();
+}
+
+async function renderReport(panel) {
+  panel.replaceChildren(loading());
+  await ensureHubBasics();
+  const d = await hubData();
+  const redraw = () => renderReport(panel);
+  const month = S.reportMonth || bl.monthKey();
+  const rows = bl.monthCharges({ hostinger: d.hostinger, render: d.render, doc: S.billing.doc, entries: vaultDates(), month });
+  const sum = bl.summarize(rows);
+  const go = (n) => {
+    S.reportMonth = bl.shiftMonth(month, n);
+    redraw();
+  };
+  const csv = button('تنزيل Excel (CSV)', { kind: 'secondary', small: true, iconName: 'download', onClick: () => download(bl.toCsv(rows, { provider: PROVIDER_LABEL, state: STATE_LABEL }), `report-${month}.csv`) });
+  const print = button('طباعة / حفظ PDF', { kind: 'secondary', small: true, iconName: 'printer', onClick: () => window.print() });
+  const nav = h(
+    'div',
+    { class: 'month-nav no-print' },
+    button('', { kind: 'secondary', small: true, iconName: 'back', title: 'الشهر السابق', onClick: () => go(-1) }),
+    h('strong', null, monthName(month)),
+    h('button', { type: 'button', class: 'btn btn-secondary btn-sm btn-icon flip', title: 'الشهر التالي', 'aria-label': 'الشهر التالي', onClick: () => go(1) }, icon('back', 18)),
+    month !== bl.monthKey() ? button('هذا الشهر', { kind: 'ghost', small: true, onClick: () => {
+      S.reportMonth = bl.monthKey();
+      redraw();
+    } }) : null,
+  );
+
+  const clientRows = sum.clients.map((c) => h(
+    'tr',
+    null,
+    h('td', { 'data-label': 'العميل' }, c.client ? h('bdi', null, c.client) : h('span', { class: 'muted' }, 'بدون عميل')),
+    h('td', { class: 'num', 'data-label': 'البنود' }, num(c.count)),
+    h('td', { class: 'num', 'data-label': 'التكلفة علينا' }, moneyBag(c.cost)),
+    h('td', { class: 'num', 'data-label': 'المطلوب منه' }, moneyBag(c.sell)),
+  ));
+  const chargeRows = rows.map((r) => h(
+    'tr',
+    { class: r.state === 'manual' ? 'is-manual' : '' },
+    h('td', { class: 'nowrap', 'data-label': 'التاريخ' }, fmtDay(bl.dayOf(r.date))),
+    h('td', { 'data-label': 'البند' }, h('span', null, h('bdi', null, r.title), r.note ? h('span', { class: 'muted small block' }, r.note) : null)),
+    h('td', { 'data-label': 'المزوّد' }, r.providerName || PROVIDER_LABEL[r.provider] || r.provider),
+    h('td', { 'data-label': 'العميل' }, h('span', null, r.client ? h('bdi', null, r.client) : h('span', { class: 'muted' }, '—'), r.clientGuessed ? h('span', { class: 'muted small' }, ' (اقتراح)') : null)),
+    h('td', { class: 'num', 'data-label': 'التكلفة' }, r.cost === null ? (r.provider === 'vault' ? '—' : h('span', { class: 'tag tag-warn' }, 'غير معروف')) : `${money(r.cost, r.currency)}${r.estimated && !r.costEdited ? ' *' : ''}`),
+    h('td', { class: 'num', 'data-label': 'المطلوب' }, r.sell === null ? '—' : money(r.sell, r.sellCurrency)),
+    h('td', { 'data-label': 'الحالة' }, h('span', { class: `tag${r.state === 'manual' ? ' tag-warn' : r.state === 'charged' ? '' : ' tag-admin'}` }, STATE_LABEL[r.state] || r.state)),
+    h(
+      'td',
+      { class: 'no-print no-label' },
+      r.provider === 'vault' ? null : r.kind === 'extra'
+        ? button('تعديل', { kind: 'ghost', small: true, onClick: () => editExtra(S.billing.doc.extras.find((e) => `x:${e.id}` === r.key), redraw) })
+        : button(r.client && !r.clientGuessed ? 'تعديل' : 'ربط بعميل', { kind: 'ghost', small: true, onClick: () => editCharge({ key: r.key, title: r.title, cost: r.costEdited ? null : r.cost, currency: r.currency, guessed: r.clientGuessed ? r.client : '' }, redraw) }),
+    ),
+  ));
+  const extras = S.billing.doc.extras || [];
+
+  panel.replaceChildren(...[
+    section(
+      `التقرير الشهري — ${monthName(month)}`,
+      nav,
+      h(
+        'div',
+        { class: 'stats' },
+        stat('التكلفة على الشركة', moneyBag(sum.cost)),
+        stat('المطلوب من العملاء', moneyBag(sum.sell), 'good'),
+        stat('يحتاج تجديد يدوي', num(sum.manual), sum.manual ? 'warn' : ''),
+        stat('بنود بدون عميل', num(sum.unassigned), sum.unassigned ? 'warn' : ''),
+      ),
+      h('p', { class: 'muted' }, 'كل ما يُدفع هذا الشهر لـ Hostinger و Render وأي تكلفة أضفتها، مع العميل والمبلغ المطلوب منه. اربط البنود بعملائها مرة واحدة، وكل شهر يُحسب وحده. (*) تكلفة Render تقديرية حسب الخطة.'),
+      h('div', { class: 'row-gap no-print' }, csv, print, button('إضافة تكلفة أخرى', { kind: 'secondary', small: true, iconName: 'plus', onClick: () => editExtra(null, redraw) })),
+    ),
+    section(
+      'حسب العميل',
+      sum.clients.length
+        ? h('div', { class: 'table-wrap' }, h('table', { class: 'table table-cards' }, h('thead', null, h('tr', null, h('th', null, 'العميل'), h('th', null, 'البنود'), h('th', null, 'التكلفة علينا'), h('th', null, 'المطلوب منه'))), h('tbody', null, clientRows)))
+        : h('p', { class: 'muted' }, 'لا توجد مدفوعات في هذا الشهر.'),
+    ),
+    section(
+      'كل البنود',
+      rows.length
+        ? h('div', { class: 'table-wrap' }, h('table', { class: 'table table-cards' }, h('thead', null, h('tr', null, h('th', null, 'التاريخ'), h('th', null, 'البند'), h('th', null, 'المزوّد'), h('th', null, 'العميل'), h('th', null, 'التكلفة'), h('th', null, 'المطلوب'), h('th', null, 'الحالة'), h('th', { class: 'no-print' }, ''))), h('tbody', null, chargeRows)))
+        : h('p', { class: 'muted' }, 'لا توجد بنود في هذا الشهر.'),
+    ),
+    section(
+      'الفواتير الرسمية',
+      h('p', { class: 'muted' }, 'Hostinger و Render لا يتيحان تنزيل الفواتير عبر الـ API، لذلك لا يقدر البرنامج يجلب ملفات PDF بنفسه. كل فاتورة موجودة في صفحة الفواتير عند المزوّد:'),
+      h('div', { class: 'row-gap no-print' }, extLink(HOSTINGER_INVOICES_URL, 'فواتير Hostinger'), extLink(RENDER_BILLING_URL, 'فواتير Render')),
+    ),
+    extras.length
+      ? section('تكاليف أضفتها يدويًا', h('ul', { class: 'people' }, extras.map((x) => h(
+        'li',
+        { class: 'person' },
+        h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, x.title)), x.provider ? h('span', { class: 'tag' }, x.provider) : null),
+        h('span', { class: 'muted stack-xs' }, h('span', null, `${money(x.cost, x.currency)} — ${(PERIODS.find(([v]) => v === Number(x.periodMonths || 0)) || [0, ''])[1]} من ${fmtDay(x.start)}`), x.client ? h('span', null, `العميل: ${x.client}${x.sell !== null && x.sell !== undefined ? `، نطلب منه ${money(x.sell, x.sellCurrency)}` : ''}`) : null),
+        button('تعديل', { kind: 'ghost', small: true, onClick: () => editExtra(x, redraw) }),
+      ))))
+      : null,
+  ].filter(Boolean));
 }
 
 function connectGuide(kind) {
   const steps = kind === 'hostinger'
     ? [
-      'افتح hPanel على Hostinger، ثم من صورة حسابك اختر «API» (أو افتح hpanel.hostinger.com/profile/api).',
-      'أنشئ مفتاحًا جديدًا (Generate token) واختر له مدة صلاحية، مثلًا سنة، ثم انسخه.',
+      'افتح hPanel على Hostinger بالحساب الذي عليه الدومينات والاستضافة، ثم من القائمة الجانبية اختر «API» ثم تبويب «API tokens» (أو افتح hpanel.hostinger.com/api).',
+      'اضغط «New token»، اكتب اسمًا واختر مدة الصلاحية، ثم انسخ المفتاح (يظهر مرة واحدة فقط).',
       'في Render افتح الخدمة team-vault ثم Environment، وأضف متغيرًا باسم HOSTINGER_API_TOKEN والصق المفتاح، ثم Save, rebuild, and deploy.',
     ]
     : [
@@ -1675,119 +2502,10 @@ function connectGuide(kind) {
   return h(
     'div',
     { class: 'stack-sm' },
-    h('p', null, kind === 'hostinger' ? 'غير مربوط بعد. اربطه لتظهر هنا كل الدومينات والاشتراكات وتواريخ انتهائها:' : 'غير مربوط بعد. اربطه لتظهر هنا كل الخدمات وقواعد البيانات وتواريخ انتهاء المجاني منها:'),
+    h('p', null, kind === 'hostinger' ? 'غير مربوط بعد. اربطه لتظهر هنا كل المواقع والدومينات والإيميلات والاشتراكات وبطاقات الدفع ومواعيدها:' : 'غير مربوط بعد. اربطه لتظهر هنا كل الخدمات وقواعد البيانات وخططها وتكلفتها وتواريخ انتهاء المجاني منها:'),
     h('ol', { class: 'steps' }, steps.map((t) => h('li', null, t))),
     h('p', { class: 'muted' }, 'المفتاح يُحفظ فقط في إعدادات Render، لا في الكود ولا في قاعدة البيانات، والبرنامج يستخدمه للقراءة فقط ولا يغيّر أي شيء في حسابك.'),
   );
-}
-
-function listBlock(title, rows) {
-  return h('details', { class: 'tech' }, h('summary', null, title), rows.length ? h('ul', { class: 'people' }, rows) : h('p', { class: 'muted' }, 'لا يوجد شيء.'));
-}
-
-function hostingerCard(x) {
-  if (!x || x.notConfigured) return section('Hostinger', connectGuide('hostinger'));
-  if (x.loading) return section('Hostinger', h('p', { class: 'muted' }, 'جارٍ جلب البيانات…'));
-  if (x.error) return section('Hostinger', h('p', { class: 'form-error' }, integrationError(x.error)));
-  const domainRows = (x.domains || []).map((d) => h(
-    'li',
-    { class: 'person' },
-    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name || '—')), h('span', { class: `tag${d.status === 'expired' ? ' tag-danger' : ''}` }, DOMAIN_STATUS[d.status] || d.status)),
-    h('span', { class: 'muted' }, d.expiresAt ? `ينتهي ${fmtDay(d.expiresAt)}` : 'بدون تاريخ انتهاء'),
-    d.expiresAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt))}` }, daysText(daysUntil(d.expiresAt))) : h('span'),
-  ));
-  const subRows = (x.subscriptions || []).map((d) => h(
-    'li',
-    { class: 'person' },
-    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.domain ? `${d.domain} (${d.name})` : d.name || '—')), h('span', { class: `tag${['non_renewing', 'not_renewing', 'cancelled'].includes(d.status) ? ' tag-warn' : ''}` }, SUB_STATUS[d.status] || d.status), d.autoRenew ? h('span', { class: 'tag tag-admin' }, 'تجديد تلقائي') : null),
-    h('span', { class: 'muted' }, d.expiresAt || d.nextBillingAt ? `التجديد ${fmtDay(d.expiresAt || d.nextBillingAt)}` : '—', d.renewalPrice ? ` بسعر ${num(d.renewalPrice)} ${d.currency}` : ''),
-    d.expiresAt || d.nextBillingAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt || d.nextBillingAt))}` }, daysText(daysUntil(d.expiresAt || d.nextBillingAt))) : h('span'),
-  ));
-  return section(
-    'Hostinger',
-    h('p', { class: 'muted' }, `آخر تحديث ${relTime(x.fetchedAt)}${x.lastError ? ` (آخر محاولة فشلت: ${integrationError(x.lastError)})` : ''}`),
-    listBlock(`الدومينات (${num(domainRows.length)})`, domainRows),
-    listBlock(`الاشتراكات والاستضافات (${num(subRows.length)})`, subRows),
-    h('div', { class: 'row-gap' },
-      h('a', { class: 'btn btn-secondary btn-sm', href: HOSTINGER_DOMAINS_URL, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'الدومينات في hPanel')),
-      h('a', { class: 'btn btn-secondary btn-sm', href: HOSTINGER_BILLING_URL, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'الفواتير والاشتراكات في hPanel'))),
-  );
-}
-
-function renderCard(x) {
-  if (!x || x.notConfigured) return section('Render', connectGuide('render'));
-  if (x.loading) return section('Render', h('p', { class: 'muted' }, 'جارٍ جلب البيانات…'));
-  if (x.error) return section('Render', h('p', { class: 'form-error' }, integrationError(x.error)));
-  const link = (url) => (url ? h('a', { class: 'btn btn-ghost btn-sm', href: url, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'فتح')) : null);
-  const svcRows = (x.services || []).map((d) => h(
-    'li',
-    { class: 'person' },
-    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name)), h('span', { class: 'tag' }, d.type), d.plan ? h('span', { class: `tag${d.plan === 'free' ? ' tag-warn' : ''}` }, d.plan) : null, d.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
-    h('bdi', { class: 'muted mono ip' }, d.url || ''),
-    link(d.dashboardUrl),
-  ));
-  const dbRows = (x.databases || []).map((d) => h(
-    'li',
-    { class: 'person' },
-    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name)), h('span', { class: `tag${d.plan === 'free' ? ' tag-warn' : ''}` }, d.plan), d.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
-    d.expiresAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt))}` }, `تنتهي ${fmtDay(d.expiresAt)} (${daysText(daysUntil(d.expiresAt))})`) : h('span', { class: 'muted' }, 'لا تنتهي'),
-    link(d.dashboardUrl),
-  ));
-  return section(
-    'Render',
-    h('p', { class: 'muted' }, `آخر تحديث ${relTime(x.fetchedAt)}. Render لا يتيح الفواتير عبر الـ API، لذلك تظهر هنا الخدمات وقواعد البيانات فقط.`),
-    listBlock(`الخدمات (${num(svcRows.length)})`, svcRows),
-    listBlock(`قواعد البيانات (${num(dbRows.length)})`, dbRows),
-    h('a', { class: 'btn btn-secondary btn-sm', href: 'https://dashboard.render.com/billing', target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'الفواتير في Render')),
-  );
-}
-
-async function renderRenewals(panel) {
-  panel.replaceChildren(loading());
-  let d = await api.get('/admin/renewals');
-  const draw = () => {
-    const items = renewalItems(d);
-    const soon = items.filter((x) => x.days !== null && x.days <= 30);
-    const refresh = button('تحديث الآن من Hostinger و Render', { kind: 'secondary', small: true, iconName: 'restore' });
-    refresh.addEventListener('click', async () => {
-      setBusy(refresh, true, 'جارٍ التحديث…');
-      try {
-        d = await api.get('/admin/renewals?refresh=1');
-        draw();
-        toast('تم تحديث بيانات التجديدات.');
-      } catch (ex) {
-        setBusy(refresh, false);
-        handleErr(ex);
-      }
-    });
-    const manual = items.filter((x) => x.source === 'entry');
-    panel.replaceChildren(
-      section(
-        'يحتاج تجديد خلال 30 يومًا',
-        soon.length ? h('ul', { class: 'people' }, soon.map(renewalRow)) : h('p', { class: 'muted' }, 'لا شيء ينتهي خلال الشهر القادم.'),
-        h('div', { class: 'row-gap' }, refresh),
-      ),
-      hostingerCard(d.hostinger),
-      renderCard(d.render),
-      section(
-        'تواريخ مسجّلة في الخزنة',
-        h('p', { class: 'muted' }, 'لأي شيء ليس على Hostinger أو Render (دومين عند شركة أخرى، اشتراك برنامج، باقة إعلانات…): افتح الحساب في الخزنة واملأ «تاريخ التجديد أو الانتهاء» في تفاصيل البرنامج.'),
-        manual.length ? h('ul', { class: 'people' }, manual.map(renewalRow)) : null,
-      ),
-    );
-    if ((d.hostinger && d.hostinger.loading) || (d.render && d.render.loading)) {
-      setTimeout(async () => {
-        if (!panel.isConnected) return;
-        try {
-          d = await api.get('/admin/renewals');
-          draw();
-        } catch {
-          /* keep the current view */
-        }
-      }, 4000);
-    }
-  };
-  draw();
 }
 
 async function renderDevices(panel) {
@@ -1918,7 +2636,8 @@ async function renderBackup(panel) {
         const sec = await vc.openSecret(S.keys.vaultKey, x.id, x.keyVersion, x.secret);
         entries.push({ ...meta, ...sec, createdAt: x.createdAt, updatedAt: x.updatedAt });
       }
-      const file = await vc.sealBackup(ep1.value, { app: 'team-vault', exportedAt: new Date().toISOString(), count: entries.length, entries });
+      const billing = (S.billing || (await loadBilling())) ? S.billing.doc : null;
+      const file = await vc.sealBackup(ep1.value, { app: 'team-vault', exportedAt: new Date().toISOString(), count: entries.length, entries, billing: billing ? { items: billing.items, extras: billing.extras } : undefined });
       download(file, `vault-backup-${new Date().toISOString().slice(0, 10)}.tvault`);
       ep1.value = '';
       ep2.value = '';
@@ -1984,11 +2703,30 @@ async function renderBackup(panel) {
         const r = await api.post('/admin/import', { keyVersion: S.keys.keyVersion, entries: toAdd.slice(i, i + 500) });
         added += r.added;
       }
+      let notes = 0;
+      if (data.billing && typeof data.billing === 'object') {
+        const items = data.billing.items && typeof data.billing.items === 'object' ? data.billing.items : {};
+        const extras = Array.isArray(data.billing.extras) ? data.billing.extras : [];
+        await updateBilling((doc) => {
+          for (const [k, v] of Object.entries(items)) {
+            if (!doc.items[k] && v && typeof v === 'object') {
+              doc.items[k] = v;
+              notes += 1;
+            }
+          }
+          for (const x of extras) {
+            if (x && x.id && !doc.extras.some((e) => e.id === x.id)) {
+              doc.extras.push(x);
+              notes += 1;
+            }
+          }
+        });
+      }
       await loadEntries();
       file.value = '';
       ip.value = '';
       const addedText = added ? `تمت إضافة ${countLabel(added, 'حساب واحد', 'حسابين', 'حسابات', 'حسابًا')}` : 'لا توجد حسابات جديدة في الملف';
-      toast(`${addedText}${skipped ? `، وتم تخطي ${num(skipped)} مكرر` : ''}.`);
+      toast(`${addedText}${skipped ? `، وتم تخطي ${num(skipped)} مكرر` : ''}${notes ? `، واسترجاع ${num(notes)} من بيانات الفواتير` : ''}.`);
     } catch (ex) {
       handleErr(ex);
     } finally {

@@ -312,10 +312,32 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
   await t.test('renewals come from Hostinger and Render with read-only calls', async () => {
     const r = await A.api('GET', '/admin/renewals?refresh=1');
     assert.equal(r.status, 200, JSON.stringify(r.data));
-    assert.equal(r.data.hostinger.domains.length, 4);
+    assert.equal(r.data.windowDays, 60);
+    assert.equal(r.data.hostinger.domains.length, 6);
     assert.ok(r.data.hostinger.domains.some((x) => x.name === 'bücher.de'), 'punycode domains are shown in letters');
+    const hx = r.data.hostinger;
+    assert.deepEqual(hx.errors, []);
+    assert.equal(hx.websites.length, 2);
+    const site = hx.websites.find((w) => w.domain === 'starstyle.com');
+    assert.equal(site.plan, 'Business');
+    assert.equal(site.subscriptionId, 'sub-1', 'website → hosting order → subscription');
+    const subs = Object.fromEntries(hx.subscriptions.map((x) => [x.id, x]));
+    assert.equal(subs['sub-1'].title, 'starstyle.com (Business Web Hosting)');
+    assert.equal(subs['sub-3'].title, 'starstyle.com (.COM Domain)');
+    assert.equal(subs['sub-4'].domain, 'old-client.com', 'cancelled ones still match their own domain');
+    assert.equal(subs['sub-5'].title, 'nilefoods.de (.DE Domain)', 'charged a month before the domain ends');
+    assert.equal(subs['sub-7'].mailDomain, 'starstyle.com', 'mailbox matched to its subscription');
+    assert.equal(subs['sub-6'].kind, 'hosting');
+    assert.equal(subs['sub-7'].kind, 'email');
+    assert.equal(hx.mailOrders.find((m) => m.id === 'mo-2').subscriptionId, undefined);
+    assert.equal(hx.paymentMethods[0].identifier, 'visa_ending_4242');
+    const rx = r.data.render;
+    assert.deepEqual(rx.errors, []);
+    assert.equal(rx.keyValues[0].name, 'star-cache');
+    assert.equal(rx.owners[0].name, 'GoTrend');
+    assert.deepEqual(rx.services.find((x) => x.id === 'srv-1').customDomains, [{ name: 'www.starstyle.com', verified: true, type: 'subdomain' }]);
     assert.equal(r.data.hostinger.subscriptions.find((x) => x.id === 'sub-1').renewalPrice, 155.88);
-    assert.equal(r.data.render.services.length, 2);
+    assert.equal(r.data.render.services.length, 3);
     assert.ok(r.data.render.databases.find((x) => x.name === 'star-style-db').expiresAt);
     assert.ok(!JSON.stringify(r.data).includes('test-token'), 'tokens never reach the browser');
     assert.ok(mock.calls.length >= 4);
@@ -325,8 +347,10 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     }
     const st = await A.api('GET', '/admin/status');
     const names = st.data.renewals.map((x) => x.title);
-    for (const n of ['star-style-db', 'starstyle.com (.COM Domain)', 'Business Web Hosting', 'old-client.com']) assert.ok(names.includes(n), n);
-    for (const n of ['nilefoods.net', 'nilefoods.net (.net Domain)', 'starstyle.com']) assert.ok(!names.includes(n), n);
+    for (const n of ['star-style-db', 'starstyle.com (.COM Domain)', 'starstyle.com (Business Web Hosting)', 'old-client.com', 'nilefoods.de (.DE Domain)', 'nilefoods.net (Premium Business Email)', 'Visa visa_ending_4242', 'starstyle.com (Starter Business Email)']) assert.ok(names.includes(n), n);
+    for (const n of ['nilefoods.net', 'nilefoods.net (.net Domain)', 'starstyle.com', 'nilefoods.de']) assert.ok(!names.includes(n), n);
+    assert.ok(st.data.renewals.every((x) => x.key && x.days <= 60), 'two months ahead, each with a stable key');
+    assert.equal(st.data.renewals.find((x) => x.source === 'render_database').link, 'https://dashboard.render.com/d/dpg-1');
     assert.equal(st.data.renewals[0].title, 'old-client.com', 'already expired comes first');
     assert.equal(st.data.renewals.find((x) => x.title === 'bücher.de').days, 9, 'counted in calendar days, like hPanel');
 
@@ -335,6 +359,40 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     const integ = await import(path.join(root, 'src/integrations.js'));
     await assert.rejects(integ.hostingerSnapshot('wrong-token'), (e) => e.code === 'auth');
     await assert.rejects(integ.renderSnapshot('wrong-token'), (e) => e.code === 'auth');
+  });
+
+  await t.test('billing notes are admin-only, encrypted and versioned', async () => {
+    const empty = await A.api('GET', '/admin/billing');
+    assert.equal(empty.status, 200);
+    assert.equal(empty.data.blob, null);
+    assert.equal(empty.data.revision, 0);
+    const doc = { v: 1, noticeSalt: vc.toB64(vc.randomBytes(32)), items: { 'hs:sub-1': { client: 'Star Style', sell: 200, sellCurrency: 'EUR' } }, extras: [{ id: 'x1', title: 'Google Workspace', client: 'Nile Foods', cost: 6, currency: 'USD', periodMonths: 1, start: '2026-01-05' }] };
+    const blob = await vc.sealDoc(adminVault.vaultKey, 'billing', adminVault.keyVersion, doc);
+    const put = await A.api('PUT', '/admin/billing', { keyVersion: adminVault.keyVersion, blob, revision: 0 });
+    assert.equal(put.status, 200, JSON.stringify(put.data));
+    assert.equal(put.data.revision, 1);
+    const stale = await A.api('PUT', '/admin/billing', { keyVersion: adminVault.keyVersion, blob, revision: 0 });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.data.error, 'billing_changed');
+    const wrongKey = await A.api('PUT', '/admin/billing', { keyVersion: adminVault.keyVersion + 1, blob, revision: 1 });
+    assert.equal(wrongKey.status, 409);
+    assert.equal(wrongKey.data.error, 'key_changed');
+    const bad = await A.api('PUT', '/admin/billing', { keyVersion: adminVault.keyVersion, blob: '<script>', revision: 1 });
+    assert.equal(bad.status, 400);
+    const got = await A.api('GET', '/admin/billing');
+    assert.deepEqual(await vc.openDoc(adminVault.vaultKey, 'billing', got.data.keyVersion, got.data.blob), doc);
+    const row = (await db.query('SELECT blob_ct FROM billing_doc')).rows[0];
+    assert.ok(row.blob_ct.startsWith('s1.'), 'server layer on top');
+    assert.ok(!row.blob_ct.includes(blob) && !JSON.stringify(row).includes('Star Style'));
+
+    const mark = crypto.createHash('sha256').update('x').digest('hex');
+    assert.equal((await A.api('POST', '/admin/notices/read', { keys: [mark] })).status, 200);
+    assert.equal((await A.api('POST', '/admin/notices/read', { keys: ['not-a-hash'] })).status, 400);
+    assert.equal((await A.api('POST', '/admin/notices/read', { keys: [mark] })).status, 200, 'marking twice is fine');
+    const st = await A.api('GET', '/admin/status');
+    assert.deepEqual(st.data.noticeReads, [mark]);
+    const log = await A.api('GET', '/admin/audit');
+    assert.ok(log.data.items.some((x) => x.action === 'billing_update'));
   });
 
   await t.test('unknown users get a stable fake salt', async () => {
@@ -400,6 +458,8 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     const forbidden = await B.api('GET', '/admin/users');
     assert.equal(forbidden.status, 403);
     assert.equal((await B.api('GET', '/admin/renewals')).status, 403);
+    assert.equal((await B.api('GET', '/admin/billing')).status, 403, 'billing notes are for admins only');
+    assert.equal((await B.api('POST', '/admin/notices/read', { keys: [] })).status, 403);
   });
 
   await t.test('TOTP codes cannot be replayed and wrong codes fail', async () => {
@@ -475,8 +535,17 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     for (const u of d.data.users.filter((x) => x.id !== memberId)) wraps.push({ userId: u.id, wrapped: await vc.wrapVaultKey(raw, u.publicKey, u.id, newVersion) });
     const stale = await A.api('POST', '/admin/rotate', { fromVersion: d.data.keyVersion, newVersion, revision: d.data.revision - 1, removeUserId: memberId, entries, wraps });
     assert.equal(stale.status, 409);
-    const r = await A.api('POST', '/admin/rotate', { fromVersion: d.data.keyVersion, newVersion, revision: d.data.revision, removeUserId: memberId, entries, wraps });
+    // The billing notes must move to the new key in the same step.
+    assert.ok(d.data.billing);
+    const notes = await vc.openDoc(adminVault.vaultKey, 'billing', d.data.billing.keyVersion, d.data.billing.blob);
+    const billing = await vc.sealDoc(newKey, 'billing', newVersion, notes);
+    const noBilling = await A.api('POST', '/admin/rotate', { fromVersion: d.data.keyVersion, newVersion, revision: d.data.revision, removeUserId: memberId, entries, wraps });
+    assert.equal(noBilling.status, 409, 'cannot leave the billing notes on the old key');
+    const r = await A.api('POST', '/admin/rotate', { fromVersion: d.data.keyVersion, newVersion, revision: d.data.revision, removeUserId: memberId, entries, wraps, billing, billingRevision: d.data.billing.revision });
     assert.equal(r.status, 200, JSON.stringify(r.data));
+    const after = await A.api('GET', '/admin/billing');
+    assert.equal(after.data.keyVersion, newVersion);
+    assert.deepEqual(await vc.openDoc(newKey, 'billing', after.data.keyVersion, after.data.blob), notes);
     raw.fill(0);
 
     const gone = await B.api('GET', '/entries');

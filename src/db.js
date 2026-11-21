@@ -166,6 +166,27 @@ CREATE TABLE IF NOT EXISTS audit (
   details  jsonb
 );
 
+-- Billing notes for admins (which client each subscription belongs to, what we charge them,
+-- extra recurring costs). One document, encrypted in the browser with the vault key (layer 1)
+-- and again on the server (layer 2), like the credentials.
+CREATE TABLE IF NOT EXISTS billing_doc (
+  id          smallint PRIMARY KEY CHECK (id = 1),
+  key_version integer NOT NULL,
+  blob_ct     text NOT NULL,
+  revision    integer NOT NULL DEFAULT 1,
+  updated_by  uuid,
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Which alerts each admin has already seen. Keys are HMACs computed in the browser with a
+-- secret kept inside the encrypted billing document, so they reveal nothing about the alert.
+CREATE TABLE IF NOT EXISTS notice_reads (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key     text NOT NULL,
+  read_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, key)
+);
+
 -- The activity log is append-only: the database itself ignores edits and deletes.
 CREATE OR REPLACE RULE audit_no_update AS ON UPDATE TO audit DO INSTEAD NOTHING;
 CREATE OR REPLACE RULE audit_no_delete AS ON DELETE TO audit DO INSTEAD NOTHING;

@@ -10,6 +10,7 @@ import hmac
 import struct
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import sync_playwright, expect
 
@@ -245,15 +246,86 @@ with sync_playwright() as p:
     expect(page.locator('.log')).to_contain_text('طلب دخول من جهاز جديد')
     shot(page, '15-admin-audit')
 
-    page.get_by_role('tab', name='التجديدات').click()
-    soon = page.locator('.card').filter(has_text='يحتاج تجديد خلال 30 يومًا')
-    for name in ['old-client.com', 'star-style-db', 'starstyle.com (.COM Domain)', 'Business Web Hosting', 'Cairo Gym']:
-        expect(soon).to_contain_text(name, timeout=15000)
-    expect(soon).not_to_contain_text('nilefoods.net')
+    # ---------- subscriptions & invoices: alerts, Hostinger, Render, monthly report ----------
+    page.locator('.topbar .bell').click()
+    expect(page.get_by_role('tab', name='التنبيهات')).to_have_attribute('aria-selected', 'true')
+    hub = page.locator('.admin-panel')
+    for name in ['old-client.com', 'star-style-db', 'starstyle.com (.COM Domain)', 'starstyle.com (Business Web Hosting)', 'Cairo Gym',
+                 'nilefoods.de (.DE Domain)', 'Visa visa_ending_4242', 'starstyle.com (Starter Business Email)', 'nilefoods.net (Premium Business Email)']:
+        expect(hub).to_contain_text(name, timeout=20000)
+    expect(hub).not_to_contain_text('nilefoods.net (.net Domain)')
     # A domain ending at 23:59:59 UTC in 9 days reads "in 9 days" in Cairo too, with its name in letters.
-    expect(soon.locator('.person').filter(has_text='bücher.de')).to_contain_text('بعد 9 أيام')
-    shot(page, '15b-admin-renewals')
+    expect(hub.locator('.alert-item').filter(has_text='bücher.de')).to_contain_text('بعد 9 أيام')
+    expect(hub.get_by_role('heading', name='خلال شهرين (2)')).to_be_visible()
+    bell = page.locator('.topbar [data-bell]')
+    expect(bell).to_be_visible()
+    unread_before = int(bell.inner_text())
+    assert unread_before >= 10, unread_before
+    hub.locator('.alert-item').filter(has_text='star-style-db').get_by_role('button', name='تعليم كمقروء').click()
+    expect(bell).to_have_text(str(unread_before - 1))
+    shot(page, '15b-alerts')
+    page.get_by_role('button', name='تعليم الكل كمقروء').click()
+    expect(bell).to_be_hidden()
 
+    page.get_by_role('tab', name='Hostinger').click()
+    for text in ['WordPress', 'Website Builder', 'موقوف', 'Starter Business Email', 'visa_ending_4242', 'bücher.de', 'الخطة: Business']:
+        expect(hub).to_contain_text(text, timeout=20000)
+    row = hub.locator('li.person').filter(has_text='starstyle.com (Business Web Hosting)')
+    row.get_by_role('button', name='ربط بعميل').click()
+    dlg = page.locator('dialog[open]')
+    dlg.get_by_label('العميل', exact=True).fill('Star Style - ستار ستايل')
+    dlg.get_by_label('المطلوب من العميل').fill('250')
+    dlg.get_by_role('button', name='حفظ').click()
+    expect(page.locator('.toast').filter(has_text='تم حفظ العميل')).to_be_visible()
+    expect(hub.locator('li.person').filter(has_text='starstyle.com (Business Web Hosting)')).to_contain_text('العميل: Star Style - ستار ستايل')
+    shot(page, '15c-hostinger')
+
+    page.get_by_role('tab', name='Render').click()
+    for text in ['nile-api', 'www.starstyle.com', 'star-cache', 'GoTrend', 'موقوفة']:
+        expect(hub).to_contain_text(text, timeout=20000)
+    # standard $25 + basic_256mb $6 + Key Value starter $10; the suspended service is not counted
+    expect(hub.locator('.stat').filter(has_text='التكلفة الشهرية التقديرية')).to_contain_text('41')
+    shot(page, '15d-render')
+
+    page.get_by_role('tab', name='التقرير الشهري').click()
+    expect(hub.get_by_role('heading', name='حسب العميل')).to_be_visible(timeout=20000)
+    expect(hub).to_contain_text('nile-api')  # Render costs every month
+    # go to the month in which the hosting renewal (in 20 days) falls
+    now = datetime.now(timezone.utc)
+    target = now + timedelta(days=20)
+    for _ in range((target.year - now.year) * 12 + target.month - now.month):
+        page.get_by_role('button', name='الشهر التالي').click()
+    line = hub.locator('tr').filter(has_text='starstyle.com (Business Web Hosting)')
+    expect(line).to_contain_text('Star Style - ستار ستايل')
+    expect(line).to_contain_text('250')
+    expect(line).to_contain_text('يحتاج تجديد يدوي')
+    expect(hub.locator('table').first.locator('tr').filter(has_text='Star Style - ستار ستايل')).to_contain_text('250')
+    page.get_by_role('button', name='إضافة تكلفة أخرى').click()
+    dlg = page.locator('dialog[open]')
+    dlg.get_by_label('البند').fill('Google Workspace')
+    dlg.get_by_label('الشركة').fill('Google')
+    dlg.get_by_label('العميل', exact=True).fill('Nile Foods')
+    dlg.get_by_label('التكلفة علينا').fill('6')
+    dlg.get_by_label('المطلوب من العميل').fill('15')
+    dlg.get_by_label('أول موعد').fill(f'{target.year}-{target.month:02d}-15')
+    dlg.get_by_role('button', name='حفظ').click()
+    expect(page.locator('.toast').filter(has_text='تم حفظ البند')).to_be_visible()
+    expect(hub.locator('tr').filter(has_text='Google Workspace')).to_contain_text('Nile Foods')
+    with page.expect_download() as dl:
+        page.get_by_role('button', name='تنزيل Excel (CSV)').click()
+    csv_text = open(dl.value.path(), encoding='utf-8-sig').read()
+    assert 'starstyle.com (Business Web Hosting)' in csv_text and 'Star Style - ستار ستايل' in csv_text and ',250,' in csv_text, csv_text[:400]
+    assert 'Google Workspace,Google,Nile Foods,6,USD,15,EUR' in csv_text, csv_text
+    shot(page, '15e-report')
+    page.set_viewport_size({'width': 390, 'height': 844})
+    shot(page, '15f-report-phone')
+    page.get_by_role('tab', name='التنبيهات').click()
+    expect(page.locator('.alert-item').first).to_be_visible(timeout=20000)
+    shot(page, '15g-alerts-phone')
+    page.set_viewport_size({'width': 1366, 'height': 900})
+
+    page.locator('details.menu > summary').click()
+    page.get_by_role('button', name='الإدارة').click()
     page.get_by_role('tab', name='النسخ الاحتياطي').click()
     page.get_by_label('كلمة سر النسخة الاحتياطية', exact=True).first.fill('Backup-Pass-2026-OK!')
     page.get_by_label('أعد كتابتها').fill('Backup-Pass-2026-OK!')
@@ -279,6 +351,14 @@ with sync_playwright() as p:
     expect(mpage.get_by_label('رمز التحقق')).to_be_visible()  # back to full login: the account is gone
     page.get_by_role('tab', name='رابط الدخول').click()
     shot(page, '17-admin-gate')
+    # the billing notes moved to the new vault key with everything else
+    page.locator('.topbar .bell').click()
+    page.get_by_role('tab', name='التقرير الشهري').click()
+    expect(page.locator('.admin-panel')).to_contain_text('التقرير الشهري', timeout=20000)
+    page.locator('details.menu > summary').click()
+    page.locator('.menu-pop').get_by_role('button', name='الاشتراكات والفواتير').click()
+    page.get_by_role('tab', name='Hostinger').click()
+    expect(page.locator('li.person').filter(has_text='starstyle.com (Business Web Hosting)')).to_contain_text('العميل: Star Style - ستار ستايل', timeout=20000)
 
     # ---------- lock and unlock ----------
     page.get_by_role('button', name='رجوع للخزنة').click()
