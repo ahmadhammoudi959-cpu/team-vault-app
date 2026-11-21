@@ -18,8 +18,12 @@ export function initPool(url) {
   else if (mode === 'no-verify') ssl = { rejectUnauthorized: false };
   else if (mode !== 'disable' && !privateHost) ssl = { rejectUnauthorized: true };
 
+  // Keep strict certificate checking even after node-postgres changes what "require" means.
+  const u = new URL(url);
+  if (['require', 'prefer', 'verify-ca'].includes(u.searchParams.get('sslmode'))) u.searchParams.set('sslmode', 'verify-full');
+
   pool = new pg.Pool({
-    connectionString: url,
+    connectionString: u.toString(),
     ssl,
     max: 6,
     idleTimeoutMillis: 30_000,
