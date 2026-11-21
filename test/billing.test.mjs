@@ -66,9 +66,9 @@ test('recurring dates are found before and after the anchor', () => {
 const hostinger = {
   subscriptions: [
     // auto-renewing yearly domain, next charge 3 Nov 2027 → charged 3 Nov 2026 too (bought before)
-    { id: 's1', name: '.DE Domain', kind: 'domain', title: 'starstyle-shop.de (.DE Domain)', domain: 'starstyle-shop.de', status: 'active', autoRenew: true, renewalPrice: 11.99, totalPrice: 4.99, currency: 'EUR', periodCount: 1, periodUnit: 'year', createdAt: '2025-11-05T10:00:00.000Z', nextBillingAt: '2027-11-03T10:00:00.000Z', expiresAt: null },
+    { id: 's1', name: '.DE Domain', kind: 'domain', title: 'mode-beispiel.de (.DE Domain)', domain: 'mode-beispiel.de', status: 'active', autoRenew: true, renewalPrice: 11.99, totalPrice: 4.99, currency: 'EUR', periodCount: 1, periodUnit: 'year', createdAt: '2025-11-05T10:00:00.000Z', nextBillingAt: '2027-11-03T10:00:00.000Z', expiresAt: null },
     // not renewing: ends 30 Nov 2026 → a manual renewal in November, nothing after
-    { id: 's2', name: '.DE Domain', kind: 'domain', title: 'h-a-gebäudereinigung.de (.DE Domain)', domain: 'h-a-gebäudereinigung.de', status: 'non_renewing', autoRenew: false, renewalPrice: 11.99, totalPrice: 4.99, currency: 'EUR', periodCount: 1, periodUnit: 'year', createdAt: '2025-11-20T10:00:00.000Z', nextBillingAt: null, expiresAt: '2026-11-30T23:59:59.000Z' },
+    { id: 's2', name: '.DE Domain', kind: 'domain', title: 'bäckerei-beispiel.de (.DE Domain)', domain: 'bäckerei-beispiel.de', status: 'non_renewing', autoRenew: false, renewalPrice: 11.99, totalPrice: 4.99, currency: 'EUR', periodCount: 1, periodUnit: 'year', createdAt: '2025-11-20T10:00:00.000Z', nextBillingAt: null, expiresAt: '2026-11-30T23:59:59.000Z' },
     // monthly hosting, charged on the 17th
     { id: 's3', name: 'Premium Business Email', kind: 'email', title: 'Premium Business Email', status: 'active', autoRenew: true, renewalPrice: 5.99, totalPrice: 5.99, currency: 'EUR', periodCount: 1, periodUnit: 'month', createdAt: '2026-09-17T14:44:02.000Z', nextBillingAt: '2026-12-17T14:44:02.000Z', expiresAt: null },
     // cancelled: past charges only
@@ -77,7 +77,7 @@ const hostinger = {
 };
 const render = {
   services: [
-    { id: 'srv-1', name: 'star-style', type: 'web_service', plan: 'free', createdAt: '2026-01-01T00:00:00Z', customDomains: [{ name: 'www.starstyle-shop.de' }] },
+    { id: 'srv-1', name: 'star-style', type: 'web_service', plan: 'free', createdAt: '2026-01-01T00:00:00Z', customDomains: [{ name: 'www.mode-beispiel.de' }] },
     { id: 'srv-2', name: 'nile-api', type: 'web_service', plan: 'standard', createdAt: '2026-01-01T00:00:00Z' },
     { id: 'srv-3', name: 'old-api', type: 'web_service', plan: 'starter', suspended: true, createdAt: '2026-01-01T00:00:00Z' },
     { id: 'srv-4', name: 'nightly', type: 'cron_job', plan: 'starter', createdAt: '2026-01-01T00:00:00Z' },
@@ -90,7 +90,7 @@ const render = {
   keyValues: [{ id: 'red-1', name: 'cache', plan: 'starter', createdAt: '2026-01-01T00:00:00Z' }],
 };
 const entries = [
-  { id: 'e1', client: 'Star Style', title: 'Star Style: Website', url: 'https://starstyle-shop.de', renewAt: '2026-11-25' },
+  { id: 'e1', client: 'Mode Beispiel', title: 'Mode Beispiel: Website', url: 'https://mode-beispiel.de', renewAt: '2026-11-25' },
   { id: 'e2', client: 'Nile Foods', title: 'Nile Foods: Domain', url: 'https://nilefoods.net' },
 ];
 
@@ -98,23 +98,23 @@ test('the November report has every charge, with clients and prices', () => {
   const doc = {
     v: 1,
     items: {
-      'hs:s2': { client: 'H&A Gebäudereinigung', sell: 25, sellCurrency: 'EUR' },
+      'hs:s2': { client: 'Bäckerei Beispiel', sell: 25, sellCurrency: 'EUR' },
       'rs:srv-2': { client: 'Nile Foods', sell: 40, sellCurrency: 'USD' },
       'rs:srv-4': { cost: 3.5 },
     },
-    extras: [{ id: 'x1', title: 'Meta ads management', client: 'Star Style', cost: 0, currency: 'EUR', sell: 300, sellCurrency: 'EUR', periodMonths: 1, start: '2026-01-10' }],
+    extras: [{ id: 'x1', title: 'Meta ads management', client: 'Mode Beispiel', cost: 0, currency: 'EUR', sell: 300, sellCurrency: 'EUR', periodMonths: 1, start: '2026-01-10' }],
   };
   const rows = b.monthCharges({ hostinger, render, doc, entries, month: '2026-11', now: NOW });
   const by = Object.fromEntries(rows.map((r) => [r.key, r]));
 
   assert.equal(by['hs:s1'].cost, 11.99, 'renewal price on renewals');
   assert.equal(by['hs:s1'].state, 'charged', 'already charged on 3 Nov');
-  assert.equal(by['hs:s1'].client, 'Star Style', 'client found from the vault by domain');
+  assert.equal(by['hs:s1'].client, 'Mode Beispiel', 'client found from the vault by domain');
   assert.equal(by['hs:s1'].clientGuessed, true);
 
   assert.equal(by['hs:s2'].state, 'manual');
   assert.equal(b.dayOf(by['hs:s2'].date), '2026-11-30');
-  assert.equal(by['hs:s2'].client, 'H&A Gebäudereinigung');
+  assert.equal(by['hs:s2'].client, 'Bäckerei Beispiel');
   assert.equal(by['hs:s2'].sell, 25);
 
   assert.equal(by['hs:s3'].cost, 5.99);
@@ -136,14 +136,14 @@ test('the November report has every charge, with clients and prices', () => {
   assert.equal(by['x:x1'].state, 'charged');
   assert.equal(b.dayOf(by['x:x1'].date), '2026-11-10');
   assert.equal(by['e:e1'].cost, null);
-  assert.equal(by['e:e1'].client, 'Star Style');
+  assert.equal(by['e:e1'].client, 'Mode Beispiel');
 
   const s = b.summarize(rows);
   assert.equal(s.cost.EUR, Math.round((11.99 + 11.99 + 5.99 + 0) * 100) / 100);
   assert.equal(s.cost.USD, 25 + 3.5 + 7.5 + 10);
   assert.equal(s.sell.EUR, 325);
   assert.equal(s.sell.USD, 40);
-  const star = s.clients.find((c) => c.client === 'Star Style');
+  const star = s.clients.find((c) => c.client === 'Mode Beispiel');
   assert.equal(star.sell.EUR, 300);
   assert.ok(s.unassigned >= 3, 'database, cache and the monthly email have no client yet');
 });
@@ -160,7 +160,7 @@ test('the December report projects auto-renewals and stops after a manual end da
 test('alerts combine server items, vault dates and typed-in costs', () => {
   const list = b.alertItems({
     renewals: [{ key: 'hd:x.de', title: 'x.de', at: '2026-11-30T23:59:59.000Z', source: 'hostinger_domain' }, { key: 'hs:far', title: 'far', at: '2027-03-01T00:00:00.000Z', source: 'hostinger_subscription' }],
-    entries: [{ id: 'e1', client: 'Star Style', title: 'Star Style: Website', renewAt: '2026-12-31' }],
+    entries: [{ id: 'e1', client: 'Mode Beispiel', title: 'Mode Beispiel: Website', renewAt: '2026-12-31' }],
     extras: [{ id: 'x1', title: 'Ads', periodMonths: 1, start: '2026-01-10', cost: 10, currency: 'EUR' }],
     now: NOW,
   });

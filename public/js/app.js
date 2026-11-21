@@ -2087,13 +2087,14 @@ async function renderHostingerTab(panel) {
   };
   const spec = (s) => ({ key: `hs:${s.id}`, title: s.title || s.name, cost: s.renewalPrice, currency: s.currency, guessed: bl.guessClient(bl.domainOf(s), entries) || '' });
 
-  // Websites
-  const siteRows = (x.websites || []).map((w) => {
+  // Websites (real domains first; Hostinger's temporary addresses last)
+  const sites = (x.websites || []).slice().sort((a, b) => Number(a.temporary) - Number(b.temporary) || String(a.domain).localeCompare(String(b.domain)));
+  const siteRows = sites.map((w) => {
     const sub = w.subscriptionId && subById.get(w.subscriptionId);
     return h(
       'li',
       { class: 'person' },
-      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, w.domain || '(بدون دومين)')), h('span', { class: 'tag' }, SITE_TYPE[w.type] || w.type || 'موقع'), w.enabled ? null : h('span', { class: 'tag tag-danger' }, 'موقوف')),
+      h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, w.domain || '(بدون دومين)')), h('span', { class: 'tag' }, SITE_TYPE[w.type] || w.type || 'موقع'), w.temporary ? h('span', { class: 'tag' }, 'رابط مؤقت') : null, w.enabled ? null : h('span', { class: 'tag tag-danger' }, 'موقوف')),
       h('span', { class: 'muted stack-xs' }, h('span', null, `الخطة: ${w.plan || '—'}`), subLine(sub), sub ? clientLine(`hs:${sub.id}`, bl.guessClient(w.domain, entries)) : null),
       h('div', { class: 'row-gap' }, sub ? dayTag(bl.subDate(sub)) : null, sub ? assignButton(spec(sub), redraw) : null),
     );
@@ -2151,6 +2152,7 @@ async function renderHostingerTab(panel) {
           'span',
           { class: 'muted stack-xs' },
           h('span', null, `${when ? `${s.autoRenew && live ? 'الخصم القادم' : 'ينتهي'} ${fmtDay(when)}` : '—'}${s.renewalPrice !== null ? ` — ${money(s.renewalPrice, s.currency)}` : ''}${periodText(s.periodCount, s.periodUnit) ? ` ${periodText(s.periodCount, s.periodUnit)}` : ''}`),
+          s.websites && s.websites.length > 1 ? h('span', null, `خطة ${s.plan || ''} تستضيف ${countLabel(s.websites.length, 'موقعًا واحدًا', 'موقعين', 'مواقع', 'موقعًا')}`.replace('  ', ' ')) : null,
           clientLine(`hs:${s.id}`, bl.guessClient(bl.domainOf(s), entries)),
         ),
         h('div', { class: 'row-gap' }, live && when ? dayTag(when) : null, assignButton(spec(s), redraw)),
@@ -2196,7 +2198,7 @@ async function renderHostingerTab(panel) {
         extLink(HOSTINGER_BILLING_URL, 'الاشتراكات في hPanel'),
       ),
     ),
-    section('المواقع', h('p', { class: 'muted' }, 'كل المواقع على الاستضافة، مع خطة كل موقع وموعد تجديدها.'), listBlock(`المواقع (${num(siteRows.length)})`, siteRows, true)),
+    section('المواقع', h('p', { class: 'muted' }, 'كل المواقع على الاستضافة، مع خطة كل موقع وموعد تجديدها.'), listBlock(`المواقع (${num(siteRows.length)})`, siteRows, siteRows.length <= 12)),
     section('الدومينات', listBlock(`الدومينات (${num(domainRows.length)})`, domainRows, true)),
     section('الإيميلات', listBlock(`الإيميلات (${num(mailRows.length)})`, mailRows, true)),
     section('الاشتراكات والمدفوعات', h('p', { class: 'muted' }, 'كل ما يُدفع لـ Hostinger. اربط كل اشتراك بعميله والمبلغ الذي تطلبه منه، ليظهر في التقرير الشهري.'), listBlock(`الاشتراكات (${num(subRows.length)})`, subRows, true)),

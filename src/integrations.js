@@ -120,11 +120,33 @@ function pairUnique(items, subs, fits) {
   return pairs;
 }
 
-// Hostinger usually charges an auto-renewing domain or mailbox up to a month before it ends.
-const chargedFor = (end, s) => {
+// Same end date (two days either way).
+const sameDay = (end, s) => {
   const a = ms(end);
   const b = ms(subscriptionDate(s));
+  return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= 2 * DAY;
+};
+// Hostinger charges an auto-renewing domain or mailbox up to a month before it ends; a
+// subscription that does not renew carries the real end date, so it has to match exactly.
+const chargedFor = (end, s) => {
+  if (!(s.autoRenew && s.nextBillingAt)) return sameDay(end, s);
+  const a = ms(end);
+  const b = ms(s.nextBillingAt);
   return Number.isFinite(a) && Number.isFinite(b) && b >= a - 31 * DAY && b <= a + 2 * DAY;
+};
+// Exact dates first, then the looser charging window for what is left.
+function pairByDate(items, subs, endOf, extra = () => true) {
+  const exact = pairUnique(items, subs, (it, s) => extra(it, s) && sameDay(endOf(it), s));
+  const used = new Set(exact.values());
+  const loose = pairUnique(items.filter((it) => !exact.has(it)), subs.filter((s) => !used.has(s)), (it, s) => extra(it, s) && chargedFor(endOf(it), s));
+  return new Map([...exact, ...loose]);
+}
+// Hostinger's temporary addresses (before a real domain is attached).
+export const isTemporaryDomain = (d) => /\.hostingersite\.com$|\.hostingersite\.[a-z]+$|\.preview-domain\.com$/i.test(d || '');
+// "hostinger_business_v3" -> "Business"
+const planName = (v) => {
+  const t = str(v, 80).replace(/^hostinger_/i, '').replace(/_v\d+$/i, '').replace(/_/g, ' ').trim();
+  return t ? t.replace(/\b\w/g, (c) => c.toUpperCase()) : '';
 };
 const tldOf = (name) => {
   const m = /^\.([a-z0-9-]+)\s+domain/i.exec(name || '');
@@ -172,12 +194,13 @@ export async function hostingerSnapshot(token) {
     username: str(x.username, 60),
     orderId: x.order_id === null || x.order_id === undefined ? null : str(x.order_id, 40),
     parentDomain: domainName(x.parent_domain),
+    temporary: isTemporaryDomain(x.domain),
     createdAt: date(x.created_at),
   }));
   const hostingOrders = (settle(o, errors, 'hosting_orders') || []).map((x) => ({
     id: str(x.id, 40),
     subscriptionId: x.subscription_id ? str(x.subscription_id, 60) : null,
-    plan: str(x.plan && x.plan.name, 80),
+    plan: planName(x.plan && x.plan.name),
     status: str(x.status, 40),
     createdAt: date(x.created_at),
   }));
@@ -226,10 +249,11 @@ export async function hostingerSnapshot(token) {
   const domainSubs = subscriptions.filter((x) => x.kind === 'domain');
   const fitsDomain = (dm, sub) => {
     const tld = tldOf(sub.name);
-    return (!tld || lower(dm.name).endsWith(tld)) && chargedFor(dm.expiresAt, sub);
+    return !tld || lower(dm.name).endsWith(tld);
   };
-  const livePairs = pairUnique(named, domainSubs.filter((x) => LIVE_SUBSCRIPTION.has(x.status)), fitsDomain);
-  const restPairs = pairUnique(named.filter((x) => !livePairs.has(x)), domainSubs.filter((x) => !LIVE_SUBSCRIPTION.has(x.status)), fitsDomain);
+  const endOf = (x) => x.expiresAt;
+  const livePairs = pairByDate(named, domainSubs.filter((x) => LIVE_SUBSCRIPTION.has(x.status)), endOf, fitsDomain);
+  const restPairs = pairByDate(named.filter((x) => !livePairs.has(x)), domainSubs.filter((x) => !LIVE_SUBSCRIPTION.has(x.status)), endOf, fitsDomain);
   for (const [dm, sub] of [...livePairs, ...restPairs]) {
     sub.domain = dm.name;
     dm.subscriptionId = sub.id;
@@ -244,13 +268,22 @@ export async function hostingerSnapshot(token) {
     sub.domain = doms[0];
     for (const dm of domains) if (dm.name === doms[0]) dm.subscriptionId = sub.id;
   }
-  const mailPairs = pairUnique(mailOrders.filter((x) => x.expiresAt), subscriptions.filter((x) => x.kind === 'email' && LIVE_SUBSCRIPTION.has(x.status)), (mo, sub) => chargedFor(mo.expiresAt, sub));
+  // A mailbox on trial belongs to a subscription on trial, and the other way round.
+  const mailPairs = pairByDate(
+    mailOrders.filter((x) => x.expiresAt && x.status !== 'suspended'),
+    subscriptions.filter((x) => x.kind === 'email' && LIVE_SUBSCRIPTION.has(x.status)),
+    (x) => x.expiresAt,
+    (mo, sub) => mo.trial === (sub.status === 'in_trial'),
+  );
   for (const [mo, sub] of mailPairs) {
     sub.mailDomain = mo.domain;
     mo.subscriptionId = sub.id;
   }
+  // A hosting plan with one website is named after it; with many, the screens show the count.
   for (const sub of subscriptions) {
-    const target = sub.domain || sub.mailDomain || (sub.websites && sub.websites.length ? `${sub.websites[0]}${sub.websites.length > 1 ? ` +${sub.websites.length - 1}` : ''}` : '');
+    const sites = sub.websites || [];
+    const site = sites.length === 1 ? sites[0] : null;
+    const target = sub.domain || sub.mailDomain || (site && !isTemporaryDomain(site) ? site : '');
     sub.title = target ? `${target} (${sub.name})` : sub.name;
   }
   return { fetchedAt: new Date().toISOString(), domains, subscriptions, websites, hostingOrders, mailOrders, paymentMethods, errors };
