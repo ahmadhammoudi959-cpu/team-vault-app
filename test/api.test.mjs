@@ -324,8 +324,8 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     }
     const st = await A.api('GET', '/admin/status');
     const names = st.data.renewals.map((x) => x.title);
-    for (const n of ['star-style-db', 'starstyle.com', 'Business Web Hosting', 'old-client.com']) assert.ok(names.includes(n), n);
-    for (const n of ['nilefoods.net', '.com Domain']) assert.ok(!names.includes(n), n);
+    for (const n of ['star-style-db', 'starstyle.com (.COM Domain)', 'Business Web Hosting', 'old-client.com']) assert.ok(names.includes(n), n);
+    for (const n of ['nilefoods.net', 'nilefoods.net (.net Domain)', 'starstyle.com']) assert.ok(!names.includes(n), n);
     assert.equal(st.data.renewals[0].title, 'old-client.com', 'already expired comes first');
 
     process.env.HOSTINGER_API_BASE = `http://127.0.0.1:${mock.port}`;

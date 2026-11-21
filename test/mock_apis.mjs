@@ -28,7 +28,9 @@ export function startMockApis({ port = 0, hostingerToken, renderToken } = {}) {
       if (url.pathname === '/api/billing/v1/subscriptions') {
         return send(200, [
           { id: 'sub-1', name: 'Business Web Hosting', status: 'active', billing_period: 12, billing_period_unit: 'month', currency_code: 'USD', total_price: 4788, renewal_price: 15588, is_auto_renewed: false, created_at: at(-345), expires_at: at(20), next_billing_at: null },
-          { id: 'sub-2', name: '.com Domain', status: 'active', billing_period: 1, billing_period_unit: 'year', currency_code: 'USD', total_price: 999, renewal_price: 1799, is_auto_renewed: true, created_at: at(-200), expires_at: at(165), next_billing_at: at(165) },
+          { id: 'sub-2', name: '.net Domain', status: 'active', billing_period: 1, billing_period_unit: 'year', currency_code: 'USD', total_price: 999, renewal_price: 1799, is_auto_renewed: true, created_at: at(-200), expires_at: at(165), next_billing_at: at(165) },
+          { id: 'sub-3', name: '.COM Domain', status: 'non_renewing', billing_period: 1, billing_period_unit: 'year', currency_code: 'USD', total_price: 999, renewal_price: 2019, is_auto_renewed: false, created_at: at(-355), expires_at: at(10), next_billing_at: null },
+          { id: 'sub-4', name: '.COM Domain', status: 'cancelled', billing_period: 1, billing_period_unit: 'year', currency_code: 'USD', total_price: 999, renewal_price: 2019, is_auto_renewed: false, created_at: at(-400), expires_at: at(-5), next_billing_at: null },
         ]);
       }
       return send(404, { message: 'not found' });

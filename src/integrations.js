@@ -78,6 +78,19 @@ export async function hostingerSnapshot(token) {
     expiresAt: date(x.expires_at),
     nextBillingAt: date(x.next_billing_at),
   }));
+  // Subscriptions are named like ".COM Domain"; link each to its domain when that is unambiguous.
+  for (const sub of subscriptions) {
+    const m = /^\.([a-z0-9-]+)\s+domain$/i.exec(sub.name);
+    if (!m) continue;
+    const tld = `.${m[1].toLowerCase()}`;
+    const same = domains.filter((dm) => dm.name.toLowerCase().endsWith(tld));
+    let match = same.length === 1 ? same[0] : null;
+    if (!match && sub.expiresAt) {
+      const near = same.filter((dm) => dm.expiresAt && Math.abs(Date.parse(dm.expiresAt) - Date.parse(sub.expiresAt)) <= 2 * 86_400_000);
+      if (near.length === 1) match = near[0];
+    }
+    if (match) sub.domain = match.name;
+  }
   if (errors.length === 2) throw new IntegrationError(errors[0].split(':')[1]);
   return { fetchedAt: new Date().toISOString(), domains, subscriptions, errors };
 }
@@ -126,6 +139,8 @@ export async function renderSnapshot(token) {
 }
 
 const DAY = 86_400_000;
+// Hostinger reports both spellings in practice.
+export const LIVE_SUBSCRIPTION = new Set(['active', 'not_renewing', 'non_renewing', 'in_trial', 'paused']);
 
 // Items that end within `windowDays` (or already ended), for banners. Small and name-only.
 export function upcoming({ hostinger, render }, windowDays = 30, now = Date.now()) {
@@ -137,10 +152,12 @@ export function upcoming({ hostinger, render }, windowDays = 30, now = Date.now(
     if (days <= windowDays) items.push({ title, at, source, days });
   };
   if (hostinger && !hostinger.error) {
-    for (const d of hostinger.domains || []) if (d.expiresAt && !['deleted', 'failed', 'requested'].includes(d.status)) push(d.name, d.expiresAt, 'hostinger_domain');
-    for (const s of hostinger.subscriptions || []) {
-      if (['active', 'not_renewing', 'in_trial', 'paused'].includes(s.status)) push(s.name, s.expiresAt || s.nextBillingAt, 'hostinger_subscription');
+    const subs = (hostinger.subscriptions || []).filter((s) => LIVE_SUBSCRIPTION.has(s.status));
+    const covered = new Set(subs.map((s) => s.domain).filter(Boolean));
+    for (const d of hostinger.domains || []) {
+      if (d.expiresAt && !covered.has(d.name) && !['deleted', 'failed', 'requested'].includes(d.status)) push(d.name, d.expiresAt, 'hostinger_domain');
     }
+    for (const s of subs) push(s.domain ? `${s.domain} (${s.name})` : s.name, s.expiresAt || s.nextBillingAt, 'hostinger_subscription');
   }
   if (render && !render.error) {
     for (const p of render.databases || []) if (p.expiresAt) push(p.name, p.expiresAt, 'render_database');

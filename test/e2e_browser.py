@@ -247,7 +247,7 @@ with sync_playwright() as p:
 
     page.get_by_role('tab', name='التجديدات').click()
     soon = page.locator('.card').filter(has_text='يحتاج تجديد خلال 30 يومًا')
-    for name in ['old-client.com', 'star-style-db', 'starstyle.com', 'Business Web Hosting', 'Cairo Gym']:
+    for name in ['old-client.com', 'star-style-db', 'starstyle.com (.COM Domain)', 'Business Web Hosting', 'Cairo Gym']:
         expect(soon).to_contain_text(name, timeout=15000)
     expect(soon).not_to_contain_text('nilefoods.net')
     shot(page, '15b-admin-renewals')

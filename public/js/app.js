@@ -1601,6 +1601,9 @@ const RENEW_SOURCE = {
   render_database: 'قاعدة بيانات على Render',
 };
 const HOSTINGER_DOMAINS_URL = 'https://hpanel.hostinger.com/domains';
+const LIVE_SUBSCRIPTION = new Set(['active', 'not_renewing', 'non_renewing', 'in_trial', 'paused']);
+const SUB_STATUS = { active: 'فعّال', not_renewing: 'لن يتجدد', non_renewing: 'لن يتجدد', cancelled: 'ملغي', paused: 'متوقف مؤقتًا', in_trial: 'تجريبي', transferred: 'منقول', future: 'لم يبدأ' };
+const DOMAIN_STATUS = { active: 'فعّال', expired: 'منتهي', pending_setup: 'قيد الإعداد', requested: 'مطلوب', pending_verification: 'بانتظار التحقق', deleted: 'محذوف', suspended: 'موقوف', failed: 'فشل' };
 const HOSTINGER_BILLING_URL = 'https://hpanel.hostinger.com/billing/subscriptions';
 const INTEGRATION_ERRORS = {
   auth: 'المفتاح (التوكن) غير صحيح أو انتهت صلاحيته. أنشئ مفتاحًا جديدًا وضعه في Render.',
@@ -1616,13 +1619,15 @@ function renewalItems(d) {
     if (e.meta.renewAt) items.push({ source: 'entry', title: `${e.meta.client}: ${platformName(e.meta)}${e.meta.label ? ` (${e.meta.label})` : ''}`, date: e.meta.renewAt, entry: e });
   }
   const h1 = d.hostinger && !d.hostinger.error && !d.hostinger.notConfigured ? d.hostinger : null;
+  const liveSubs = ((h1 && h1.subscriptions) || []).filter((x) => LIVE_SUBSCRIPTION.has(x.status));
+  const covered = new Set(liveSubs.map((x) => x.domain).filter(Boolean));
   for (const x of (h1 && h1.domains) || []) {
-    if (x.expiresAt && !['deleted', 'failed', 'requested'].includes(x.status)) items.push({ source: 'hostinger_domain', title: x.name, date: x.expiresAt, link: HOSTINGER_DOMAINS_URL, linkLabel: 'تجديد من Hostinger' });
+    if (x.expiresAt && !covered.has(x.name) && !['deleted', 'failed', 'requested'].includes(x.status)) items.push({ source: 'hostinger_domain', title: x.name, date: x.expiresAt, link: HOSTINGER_DOMAINS_URL, linkLabel: 'تجديد من Hostinger' });
   }
-  for (const x of (h1 && h1.subscriptions) || []) {
+  for (const x of liveSubs) {
     const when = x.expiresAt || x.nextBillingAt;
-    if (when && ['active', 'not_renewing', 'in_trial', 'paused'].includes(x.status)) {
-      items.push({ source: 'hostinger_subscription', title: x.name, date: when, autoRenew: x.autoRenew, price: x.renewalPrice, currency: x.currency, link: HOSTINGER_BILLING_URL, linkLabel: 'الاشتراكات على Hostinger' });
+    if (when) {
+      items.push({ source: 'hostinger_subscription', title: x.domain ? `${x.domain} (${x.name})` : x.name, date: when, autoRenew: x.autoRenew, price: x.renewalPrice, currency: x.currency, link: x.domain ? HOSTINGER_DOMAINS_URL : HOSTINGER_BILLING_URL, linkLabel: x.domain ? 'تجديد من Hostinger' : 'الاشتراكات على Hostinger' });
     }
   }
   const r1 = d.render && !d.render.error && !d.render.notConfigured ? d.render : null;
@@ -1685,14 +1690,14 @@ function hostingerCard(x) {
   const domainRows = (x.domains || []).map((d) => h(
     'li',
     { class: 'person' },
-    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name || '—')), h('span', { class: 'tag' }, d.status)),
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name || '—')), h('span', { class: `tag${d.status === 'expired' ? ' tag-danger' : ''}` }, DOMAIN_STATUS[d.status] || d.status)),
     h('span', { class: 'muted' }, d.expiresAt ? `ينتهي ${fmtDay(d.expiresAt)}` : 'بدون تاريخ انتهاء'),
     d.expiresAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt))}` }, daysText(daysUntil(d.expiresAt))) : h('span'),
   ));
   const subRows = (x.subscriptions || []).map((d) => h(
     'li',
     { class: 'person' },
-    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name || '—')), h('span', { class: 'tag' }, d.status), d.autoRenew ? h('span', { class: 'tag tag-admin' }, 'تجديد تلقائي') : null),
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.domain ? `${d.domain} (${d.name})` : d.name || '—')), h('span', { class: `tag${['non_renewing', 'not_renewing', 'cancelled'].includes(d.status) ? ' tag-warn' : ''}` }, SUB_STATUS[d.status] || d.status), d.autoRenew ? h('span', { class: 'tag tag-admin' }, 'تجديد تلقائي') : null),
     h('span', { class: 'muted' }, d.expiresAt || d.nextBillingAt ? `التجديد ${fmtDay(d.expiresAt || d.nextBillingAt)}` : '—', d.renewalPrice ? ` بسعر ${num(d.renewalPrice)} ${d.currency}` : ''),
     d.expiresAt || d.nextBillingAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt || d.nextBillingAt))}` }, daysText(daysUntil(d.expiresAt || d.nextBillingAt))) : h('span'),
   ));
