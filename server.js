@@ -18,6 +18,7 @@ import {
   HttpError, v, parseCookies, cookieName, setCookie, clearCookie, clientIp, deviceLabel, hit,
   rateLimit, securityHeaders, notFound,
 } from './src/http.js';
+import { hostingerSnapshot, renderSnapshot, upcoming } from './src/integrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEVICE_COOKIE = cookieName('vd');
@@ -174,6 +175,41 @@ function originOf(req) {
 
 async function gateLink(req) {
   return `${originOf(req)}/k/${gateToken(await getSetting('gate_version'))}`;
+}
+
+// ---------------------------------------------------------------------------
+// renewal data from Hostinger / Render (cached; refreshed on demand by admins)
+// ---------------------------------------------------------------------------
+const integ = {
+  hostinger: { token: cfg.HOSTINGER_API_TOKEN, load: hostingerSnapshot, data: null, at: 0, pending: null },
+  render: { token: cfg.RENDER_API_KEY, load: renderSnapshot, data: null, at: 0, pending: null },
+};
+const INTEG_TTL = 30 * MIN;
+
+function refreshIntegration(kind, force = false) {
+  const slot = integ[kind];
+  if (!slot.token) return Promise.resolve(null);
+  if (!force && slot.data && Date.now() - slot.at < INTEG_TTL) return Promise.resolve(slot.data);
+  if (slot.pending) return slot.pending;
+  slot.pending = slot
+    .load(slot.token)
+    .catch((e) => ({ error: (e && e.code) || 'failed', fetchedAt: new Date().toISOString() }))
+    .then((data) => {
+      // Keep the last good snapshot if a refresh fails, but remember the failure.
+      slot.data = data.error && slot.data && !slot.data.error ? { ...slot.data, lastError: data.error } : data;
+      slot.at = Date.now();
+      return slot.data;
+    })
+    .finally(() => {
+      slot.pending = null;
+    });
+  return slot.pending;
+}
+
+function integrationView(kind) {
+  const slot = integ[kind];
+  if (!slot.token) return { notConfigured: true };
+  return slot.data || { loading: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -703,13 +739,30 @@ api.get('/admin/status', requireAdmin, async (req, res) => {
          JOIN devices d ON d.id = ud.device_id
          JOIN users u ON u.id = ud.user_id AND u.status = 'active'
         WHERE ud.status = 'pending' AND NOT d.revoked)::int AS "pendingDevices"`);
+  for (const kind of Object.keys(integ)) {
+    const slot = integ[kind];
+    if (slot.token && (!slot.data || Date.now() - slot.at > 6 * 60 * MIN)) refreshIntegration(kind).catch(() => {});
+  }
   res.json({
     ...r.rows[0],
     dbPlan: cfg.DB_PLAN,
     dbCreatedAt: await getSetting('db_created_at'),
     lastBackupAt: await getSetting('last_backup_at'),
     recoveryUser: cfg.RECOVERY_USER,
+    renewals: upcoming({ hostinger: integ.hostinger.data, render: integ.render.data }, 30).slice(0, 20),
+    renewalsPending: Object.values(integ).some((slot) => slot.token && !slot.data),
   });
+});
+
+api.get('/admin/renewals', requireAdmin, async (req, res) => {
+  const force = req.query.refresh === '1';
+  if (force) {
+    const wait = hit(`renewals:${req.session.user_id}`, 10, 15 * MIN);
+    if (wait) throw new HttpError(429, 'rate_limited', { retryAfter: wait });
+  }
+  await Promise.all([refreshIntegration('hostinger', force), refreshIntegration('render', force)]);
+  if (force) await audit(req, 'renewals_refresh');
+  res.json({ windowDays: 30, hostinger: integrationView('hostinger'), render: integrationView('render') });
 });
 
 api.get('/admin/users', requireAdmin, async (req, res) => {

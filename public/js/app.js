@@ -88,6 +88,7 @@ const ACTIONS = {
   backup_export: 'تنزيل نسخة احتياطية',
   backup_import: 'استرجاع نسخة احتياطية',
   gate_rotate: 'تغيير رابط الدخول',
+  renewals_refresh: 'تحديث التجديدات من Hostinger و Render',
 };
 const ALARMING = new Set(['login_fail', 'login_while_locked', 'account_locked', 'login_device_blocked', 'reveal_limit_hit', 'device_block', 'member_remove', 'recovery_login', 'device_recovery_approved', 'entry_purge']);
 
@@ -123,6 +124,31 @@ function norm(s) {
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim();
 }
+
+const DAY_MS = 86_400_000;
+function parseDay(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || ''));
+  const t = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+}
+function daysUntil(v) {
+  const t = parseDay(v);
+  if (t === null) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((t - today.getTime()) / DAY_MS);
+}
+function fmtDay(v) {
+  const t = parseDay(v);
+  return t === null ? '—' : new Intl.DateTimeFormat('ar-EG-u-nu-latn', { dateStyle: 'long' }).format(new Date(t));
+}
+function daysText(d) {
+  if (d === null) return '';
+  if (d < 0) return `انتهى منذ ${countLabel(-d, 'يوم واحد', 'يومين', 'أيام', 'يومًا')}`;
+  if (d === 0) return 'ينتهي اليوم';
+  return `بعد ${countLabel(d, 'يوم واحد', 'يومين', 'أيام', 'يومًا')}`;
+}
+const urgency = (d) => (d === null ? '' : d <= 7 ? 'tag-danger' : d <= 30 ? 'tag-warn' : '');
 
 function safeUrl(u) {
   const s = String(u || '').trim();
@@ -710,12 +736,20 @@ function startGuards() {
   });
 }
 
+let statusRetries = 0;
 async function refreshStatus() {
   if (!S.user || S.user.role !== 'admin' || !S.keys) return;
   try {
     S.status = await api.get('/admin/status');
   } catch {
     return;
+  }
+  // Hostinger/Render data is fetched in the background the first time; look again shortly.
+  if (S.status.renewalsPending && statusRetries < 4) {
+    statusRetries += 1;
+    setTimeout(refreshStatus, 5000);
+  } else if (!S.status.renewalsPending) {
+    statusRetries = 0;
   }
   renderBanners();
   document.querySelectorAll('[data-badge]').forEach((el) => {
@@ -741,6 +775,7 @@ function topbar({ title, withSearch }) {
       S.user.role === 'admin'
         ? h('button', { type: 'button', class: 'btn btn-menu', onClick: () => showAdmin('team') }, icon('users', 18), h('span', null, 'الإدارة'), h('span', { class: 'badge', dataset: { badge: '' }, hidden: true }))
         : null,
+      S.user.role === 'admin' ? button('التجديدات والاشتراكات', { kind: 'menu', iconName: 'calendar', onClick: () => showAdmin('renewals') }) : null,
       button('تسجيل الخروج', { kind: 'menu', iconName: 'logout', onClick: () => logout() }),
     ),
   );
@@ -829,7 +864,7 @@ function renderResults() {
   const tokens = q.split(' ');
   const compactQ = q.replace(/ /g, '');
   const matches = S.entries.filter((e) => {
-    const hay = norm([e.meta.client, platformName(e.meta), platformOf(e.meta.platform).aka, e.meta.label, e.meta.username, e.meta.url].join(' '));
+    const hay = norm([e.meta.client, platformName(e.meta), platformOf(e.meta.platform).aka, e.meta.label, e.meta.username, e.meta.url, e.meta.hosting, e.meta.dbProvider].join(' '));
     return tokens.every((t) => hay.includes(t)) || hay.replace(/ /g, '').includes(compactQ);
   });
   if (!matches.length) {
@@ -926,6 +961,14 @@ async function fetchSecret(e, reason) {
 
 function notesView(s) {
   const out = [];
+  if (s.dbUrl) {
+    out.push(h(
+      'div',
+      { class: 'note-block' },
+      h('span', { class: 'cred-k' }, 'رابط قاعدة البيانات'),
+      h('div', { class: 'cred' }, h('span', { class: 'cred-v mono', dir: 'ltr' }, s.dbUrl), button('نسخ', { kind: 'ghost', small: true, iconName: 'copy', title: 'نسخ رابط قاعدة البيانات', onClick: () => copySecret(s.dbUrl, 'رابط قاعدة البيانات') })),
+    ));
+  }
   if (s.notes) out.push(h('div', { class: 'note-block' }, h('span', { class: 'cred-k' }, 'ملاحظات سرية'), h('p', { class: 'note-text' }, s.notes)));
   if (Array.isArray(s.history) && s.history.length) {
     out.push(
@@ -941,6 +984,17 @@ function notesView(s) {
 }
 
 const MASK = '••••••••••••';
+
+function rowTags(m) {
+  const tags = [];
+  if (m.hosting) tags.push(h('span', { class: 'tag' }, 'الاستضافة: ', h('bdi', null, m.hosting)));
+  if (m.dbProvider) tags.push(h('span', { class: 'tag' }, 'قاعدة البيانات: ', h('bdi', null, m.dbProvider)));
+  if (m.renewAt) {
+    const d = daysUntil(m.renewAt);
+    tags.push(h('span', { class: `tag ${urgency(d)}`, title: fmtDay(m.renewAt) }, d !== null && d <= 30 ? `التجديد ${daysText(d)}` : `التجديد: ${fmtDay(m.renewAt)}`));
+  }
+  return tags.length ? h('div', { class: 'row-tags' }, tags) : null;
+}
 
 function entryRow(e) {
   const m = e.meta;
@@ -993,6 +1047,7 @@ function entryRow(e) {
       { class: 'row-id' },
       h('span', { class: 'plat' }, h('i', { class: 'dot', dataset: { p: m.platform } }), h('span', null, platformName(m))),
       m.label ? h('bdi', { class: 'row-label' }, m.label) : null,
+      rowTags(m),
     ),
     h(
       'div',
@@ -1057,6 +1112,30 @@ async function openEntryForm(entry = null, preset = {}) {
     meter.update(pw.value);
   });
   const url = ltrInput(m.url || '', { inputmode: 'url', maxlength: 500, placeholder: 'https://' });
+  const hosting = textInput(m.hosting || '', { list: 'hosting-options', maxlength: 80, dir: 'auto' });
+  const dbProvider = textInput(m.dbProvider || '', { list: 'db-options', maxlength: 80, dir: 'auto' });
+  const dbUrl = ltrInput(secret.dbUrl || '', { class: 'mono masked', maxlength: 2000, placeholder: 'postgresql://…', 'data-lpignore': 'true', 'data-1p-ignore': 'true' });
+  const dbEye = button('', { kind: 'ghost', iconName: 'eye', title: 'إظهار أو إخفاء رابط قاعدة البيانات' });
+  dbEye.addEventListener('click', () => {
+    dbUrl.classList.toggle('masked');
+    dbEye.replaceChildren(icon(dbUrl.classList.contains('masked') ? 'eye' : 'eyeOff', 18));
+  });
+  const renewAt = h('input', { type: 'date', value: m.renewAt || '', dir: 'ltr' });
+  const techOpen = !!(m.hosting || m.dbProvider || secret.dbUrl || m.renewAt) || ['system', 'website', 'hosting', 'store'].includes(m.platform);
+  const tech = h(
+    'details',
+    { class: 'tech', open: techOpen },
+    h('summary', null, 'تفاصيل البرنامج والتجديد (اختياري)'),
+    h(
+      'div',
+      { class: 'stack' },
+      h('datalist', { id: 'hosting-options' }, ['Render', 'Hostinger', 'Vercel', 'Netlify', 'Cloudflare', 'Firebase', 'VPS'].map((n) => h('option', { value: n }))),
+      h('datalist', { id: 'db-options' }, ['Neon', 'Render Postgres', 'Supabase', 'Hostinger MySQL', 'MongoDB Atlas', 'Firebase', 'PlanetScale'].map((n) => h('option', { value: n }))),
+      h('div', { class: 'grid-2' }, field('مكان الاستضافة', hosting), field('مكان قاعدة البيانات', dbProvider)),
+      field('رابط قاعدة البيانات (سري ومشفر)', h('div', { class: 'pw-wrap' }, dbUrl, dbEye)),
+      field('تاريخ التجديد أو الانتهاء', renewAt, 'سننبّه المدير قبلها بشهر: دومين، استضافة، اشتراك برنامج، أو أي شيء له تاريخ.'),
+    ),
+  );
   const notes = h('textarea', { rows: 4, maxlength: 5000, spellcheck: 'false' });
   notes.value = secret.notes || '';
   const err = formError();
@@ -1072,6 +1151,7 @@ async function openEntryForm(entry = null, preset = {}) {
     h('div', { class: 'field' }, h('label', { for: pw.id || (pw.id = `${formId}-pw`) }, 'كلمة السر'), h('div', { class: 'pw-wrap' }, pw, eye), h('div', { class: 'pw-tools' }, meter, gen)),
     field('رابط تسجيل الدخول (اختياري)', url),
     field('ملاحظات سرية (اختياري)', notes, 'أكواد الاسترجاع، الرقم المربوط بالحساب، من معه التحقق بخطوتين… تُشفَّر مثل كلمة السر.'),
+    tech,
     err,
   );
   const save = button(editing ? 'حفظ التعديلات' : 'حفظ الحساب', { kind: 'primary', type: 'submit', iconName: 'check' });
@@ -1094,12 +1174,15 @@ async function openEntryForm(entry = null, preset = {}) {
       label: label.value.trim(),
       username: username.value.trim(),
       url: url.value.trim(),
+      hosting: hosting.value.trim() || undefined,
+      dbProvider: dbProvider.value.trim() || undefined,
+      renewAt: /^\d{4}-\d{2}-\d{2}$/.test(renewAt.value) ? renewAt.value : undefined,
     };
     let history = Array.isArray(secret.history) ? secret.history : [];
     if (editing && secret.password && pw.value !== secret.password) {
       history = [{ password: secret.password, changedAt: new Date().toISOString() }, ...history].slice(0, 5);
     }
-    const secretOut = { password: pw.value, notes: notes.value, history };
+    const secretOut = { password: pw.value, notes: notes.value, history, dbUrl: dbUrl.value.trim() || undefined };
     setBusy(save, true, 'جارٍ التشفير والحفظ…');
     try {
       const id = editing ? entry.id : vc.uuid();
@@ -1114,6 +1197,7 @@ async function openEntryForm(entry = null, preset = {}) {
       dlg.close();
       toast(editing ? 'تم حفظ التعديلات.' : 'تم حفظ الحساب في الخزنة.');
       setQuery(clientName);
+      renderBanners();
     } catch (ex) {
       setBusy(save, false);
       if (ex instanceof ApiError && ex.code === 'key_changed') {
@@ -1139,6 +1223,7 @@ async function openEntryForm(entry = null, preset = {}) {
         dlg.close();
         toast('تم حذف الحساب.');
         renderResults();
+        renderBanners();
       } catch (ex) {
         handleErr(ex);
       }
@@ -1162,6 +1247,18 @@ function renderBanners() {
   if (st.recoveryUser) {
     items.push(banner('danger', `وضع الاسترجاع مفعّل للمستخدم ${st.recoveryUser}. احذف المتغير RECOVERY_USER من إعدادات Render فور الانتهاء.`));
   }
+  const soon = [
+    ...S.entries.filter((e) => e.meta.renewAt).map((e) => ({ title: `${e.meta.client}: ${platformName(e.meta)}`, days: daysUntil(e.meta.renewAt) })),
+    ...(st.renewals || []).map((x) => ({ title: x.title, days: daysUntil(x.at) })),
+  ].filter((x) => x.days !== null && x.days <= 30).sort((a, b) => a.days - b.days);
+  if (soon.length) {
+    items.push(banner(
+      soon[0].days <= 7 ? 'danger' : 'warn',
+      [`${countLabel(soon.length, 'تجديد واحد', 'تجديدان', 'تجديدات', 'تجديدًا')} خلال 30 يومًا. الأقرب: «`, h('bdi', null, soon[0].title), `» ${daysText(soon[0].days)}.`],
+      ['عرض التجديدات', () => showAdmin('renewals')],
+      'calendar',
+    ));
+  }
   const pend = (st.pendingMembers || 0) + (st.pendingDevices || 0);
   if (pend) {
     items.push(banner('info', `${countLabel(pend, 'طلب واحد', 'طلبان', 'طلبات', 'طلبًا')} بانتظار موافقتك (أعضاء أو أجهزة جديدة).`, ['مراجعة', () => showAdmin(st.pendingMembers ? 'team' : 'devices')]));
@@ -1183,11 +1280,11 @@ function renderBanners() {
   el.replaceChildren(...items);
 }
 
-function banner(kind, text, action = null) {
+function banner(kind, text, action = null, iconName = null) {
   return h(
     'div',
     { class: `banner banner-${kind}`, role: kind === 'danger' ? 'alert' : null },
-    icon(kind === 'info' ? 'users' : 'alert', 18),
+    icon(iconName || (kind === 'info' ? 'users' : 'alert'), 18),
     h('p', null, text),
     action ? button(action[0], { kind: 'secondary', small: true, onClick: action[1] }) : null,
   );
@@ -1267,6 +1364,7 @@ async function showAccount() {
 // ---------------------------------------------------------------------------
 const ADMIN_TABS = [
   ['team', 'الفريق', 'users'],
+  ['renewals', 'التجديدات', 'calendar'],
   ['devices', 'الأجهزة', 'device'],
   ['audit', 'سجل النشاط', 'list'],
   ['backup', 'النسخ الاحتياطي', 'download'],
@@ -1285,7 +1383,7 @@ function showAdmin(tab = 'team') {
   );
   show(topbar({ title: 'الإدارة', withSearch: false }), h('main', { class: 'admin' }, nav, panel));
   refreshStatus();
-  const render = { team: renderTeam, devices: renderDevices, audit: renderAudit, backup: renderBackup, gate: renderGate, trash: renderTrash }[tab];
+  const render = { team: renderTeam, renewals: renderRenewals, devices: renderDevices, audit: renderAudit, backup: renderBackup, gate: renderGate, trash: renderTrash }[tab];
   render(panel).catch((ex) => panel.replaceChildren(h('div', { class: 'empty' }, h('p', null, errorText(ex)))));
 }
 
@@ -1496,6 +1594,195 @@ async function rotateVault(removeUserId) {
   await loadEntries();
 }
 
+const RENEW_SOURCE = {
+  entry: 'تاريخ مسجّل في الخزنة',
+  hostinger_domain: 'دومين على Hostinger',
+  hostinger_subscription: 'اشتراك على Hostinger',
+  render_database: 'قاعدة بيانات على Render',
+};
+const HOSTINGER_DOMAINS_URL = 'https://hpanel.hostinger.com/domains';
+const HOSTINGER_BILLING_URL = 'https://hpanel.hostinger.com/billing/subscriptions';
+const INTEGRATION_ERRORS = {
+  auth: 'المفتاح (التوكن) غير صحيح أو انتهت صلاحيته. أنشئ مفتاحًا جديدًا وضعه في Render.',
+  timeout: 'الخدمة لم ترد في الوقت المناسب. جرّب «تحديث» بعد قليل.',
+  network: 'تعذّر الوصول للخدمة. جرّب «تحديث» بعد قليل.',
+  rate_limited: 'طلبات كثيرة على الخدمة. جرّب بعد دقائق.',
+};
+const integrationError = (code) => INTEGRATION_ERRORS[code] || `تعذّر جلب البيانات (${code}).`;
+
+function renewalItems(d) {
+  const items = [];
+  for (const e of S.entries) {
+    if (e.meta.renewAt) items.push({ source: 'entry', title: `${e.meta.client}: ${platformName(e.meta)}${e.meta.label ? ` (${e.meta.label})` : ''}`, date: e.meta.renewAt, entry: e });
+  }
+  const h1 = d.hostinger && !d.hostinger.error && !d.hostinger.notConfigured ? d.hostinger : null;
+  for (const x of (h1 && h1.domains) || []) {
+    if (x.expiresAt && !['deleted', 'failed', 'requested'].includes(x.status)) items.push({ source: 'hostinger_domain', title: x.name, date: x.expiresAt, link: HOSTINGER_DOMAINS_URL, linkLabel: 'تجديد من Hostinger' });
+  }
+  for (const x of (h1 && h1.subscriptions) || []) {
+    const when = x.expiresAt || x.nextBillingAt;
+    if (when && ['active', 'not_renewing', 'in_trial', 'paused'].includes(x.status)) {
+      items.push({ source: 'hostinger_subscription', title: x.name, date: when, autoRenew: x.autoRenew, price: x.renewalPrice, currency: x.currency, link: HOSTINGER_BILLING_URL, linkLabel: 'الاشتراكات على Hostinger' });
+    }
+  }
+  const r1 = d.render && !d.render.error && !d.render.notConfigured ? d.render : null;
+  for (const x of (r1 && r1.databases) || []) {
+    if (x.expiresAt) items.push({ source: 'render_database', title: x.name, date: x.expiresAt, link: x.dashboardUrl || null, linkLabel: 'فتح في Render' });
+  }
+  return items.map((x) => ({ ...x, days: daysUntil(x.date) })).sort((a, b) => (a.days ?? 1e9) - (b.days ?? 1e9));
+}
+
+function renewalRow(x) {
+  const extra = [];
+  if (x.autoRenew) extra.push('تجديد تلقائي مفعّل');
+  else if (x.source === 'hostinger_subscription') extra.push('التجديد التلقائي متوقف');
+  if (x.price) extra.push(`سعر التجديد ${num(x.price)} ${x.currency || ''}`.trim());
+  return h(
+    'li',
+    { class: 'person' },
+    h('div', { class: 'person-id' }, h('span', { class: `tag ${urgency(x.days)}` }, daysText(x.days)), h('strong', null, h('bdi', null, x.title))),
+    h('span', { class: 'muted stack-xs' }, h('span', null, `${RENEW_SOURCE[x.source]}: ${fmtDay(x.date)}`), extra.length ? h('span', null, extra.join('، ')) : null),
+    h(
+      'div',
+      { class: 'row-gap' },
+      x.link ? h('a', { class: 'btn btn-secondary btn-sm', href: x.link, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, x.linkLabel || 'فتح')) : null,
+      x.entry ? button('فتح في الخزنة', { kind: 'ghost', small: true, onClick: () => {
+        showVault();
+        setQuery(x.entry.meta.client);
+      } }) : null,
+    ),
+  );
+}
+
+function connectGuide(kind) {
+  const steps = kind === 'hostinger'
+    ? [
+      'افتح hPanel على Hostinger، ثم من صورة حسابك اختر «API» (أو افتح hpanel.hostinger.com/profile/api).',
+      'أنشئ مفتاحًا جديدًا (Generate token) واختر له مدة صلاحية، مثلًا سنة، ثم انسخه.',
+      'في Render افتح الخدمة team-vault ثم Environment، وأضف متغيرًا باسم HOSTINGER_API_TOKEN والصق المفتاح، ثم Save, rebuild, and deploy.',
+    ]
+    : [
+      'في Render افتح صورة حسابك ثم Account Settings ثم API Keys، واضغط Create API Key وانسخ المفتاح.',
+      'في نفس الخدمة team-vault افتح Environment، وأضف متغيرًا باسم RENDER_API_KEY والصق المفتاح، ثم Save, rebuild, and deploy.',
+    ];
+  return h(
+    'div',
+    { class: 'stack-sm' },
+    h('p', null, kind === 'hostinger' ? 'غير مربوط بعد. اربطه لتظهر هنا كل الدومينات والاشتراكات وتواريخ انتهائها:' : 'غير مربوط بعد. اربطه لتظهر هنا كل الخدمات وقواعد البيانات وتواريخ انتهاء المجاني منها:'),
+    h('ol', { class: 'steps' }, steps.map((t) => h('li', null, t))),
+    h('p', { class: 'muted' }, 'المفتاح يُحفظ فقط في إعدادات Render، لا في الكود ولا في قاعدة البيانات، والبرنامج يستخدمه للقراءة فقط ولا يغيّر أي شيء في حسابك.'),
+  );
+}
+
+function listBlock(title, rows) {
+  return h('details', { class: 'tech' }, h('summary', null, title), rows.length ? h('ul', { class: 'people' }, rows) : h('p', { class: 'muted' }, 'لا يوجد شيء.'));
+}
+
+function hostingerCard(x) {
+  if (!x || x.notConfigured) return section('Hostinger', connectGuide('hostinger'));
+  if (x.loading) return section('Hostinger', h('p', { class: 'muted' }, 'جارٍ جلب البيانات…'));
+  if (x.error) return section('Hostinger', h('p', { class: 'form-error' }, integrationError(x.error)));
+  const domainRows = (x.domains || []).map((d) => h(
+    'li',
+    { class: 'person' },
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name || '—')), h('span', { class: 'tag' }, d.status)),
+    h('span', { class: 'muted' }, d.expiresAt ? `ينتهي ${fmtDay(d.expiresAt)}` : 'بدون تاريخ انتهاء'),
+    d.expiresAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt))}` }, daysText(daysUntil(d.expiresAt))) : h('span'),
+  ));
+  const subRows = (x.subscriptions || []).map((d) => h(
+    'li',
+    { class: 'person' },
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name || '—')), h('span', { class: 'tag' }, d.status), d.autoRenew ? h('span', { class: 'tag tag-admin' }, 'تجديد تلقائي') : null),
+    h('span', { class: 'muted' }, d.expiresAt || d.nextBillingAt ? `التجديد ${fmtDay(d.expiresAt || d.nextBillingAt)}` : '—', d.renewalPrice ? ` بسعر ${num(d.renewalPrice)} ${d.currency}` : ''),
+    d.expiresAt || d.nextBillingAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt || d.nextBillingAt))}` }, daysText(daysUntil(d.expiresAt || d.nextBillingAt))) : h('span'),
+  ));
+  return section(
+    'Hostinger',
+    h('p', { class: 'muted' }, `آخر تحديث ${relTime(x.fetchedAt)}${x.lastError ? ` (آخر محاولة فشلت: ${integrationError(x.lastError)})` : ''}`),
+    listBlock(`الدومينات (${num(domainRows.length)})`, domainRows),
+    listBlock(`الاشتراكات والاستضافات (${num(subRows.length)})`, subRows),
+    h('div', { class: 'row-gap' },
+      h('a', { class: 'btn btn-secondary btn-sm', href: HOSTINGER_DOMAINS_URL, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'الدومينات في hPanel')),
+      h('a', { class: 'btn btn-secondary btn-sm', href: HOSTINGER_BILLING_URL, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'الفواتير والاشتراكات في hPanel'))),
+  );
+}
+
+function renderCard(x) {
+  if (!x || x.notConfigured) return section('Render', connectGuide('render'));
+  if (x.loading) return section('Render', h('p', { class: 'muted' }, 'جارٍ جلب البيانات…'));
+  if (x.error) return section('Render', h('p', { class: 'form-error' }, integrationError(x.error)));
+  const link = (url) => (url ? h('a', { class: 'btn btn-ghost btn-sm', href: url, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'فتح')) : null);
+  const svcRows = (x.services || []).map((d) => h(
+    'li',
+    { class: 'person' },
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name)), h('span', { class: 'tag' }, d.type), d.plan ? h('span', { class: `tag${d.plan === 'free' ? ' tag-warn' : ''}` }, d.plan) : null, d.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
+    h('bdi', { class: 'muted mono ip' }, d.url || ''),
+    link(d.dashboardUrl),
+  ));
+  const dbRows = (x.databases || []).map((d) => h(
+    'li',
+    { class: 'person' },
+    h('div', { class: 'person-id' }, h('strong', null, h('bdi', null, d.name)), h('span', { class: `tag${d.plan === 'free' ? ' tag-warn' : ''}` }, d.plan), d.suspended ? h('span', { class: 'tag tag-danger' }, 'موقوفة') : null),
+    d.expiresAt ? h('span', { class: `tag ${urgency(daysUntil(d.expiresAt))}` }, `تنتهي ${fmtDay(d.expiresAt)} (${daysText(daysUntil(d.expiresAt))})`) : h('span', { class: 'muted' }, 'لا تنتهي'),
+    link(d.dashboardUrl),
+  ));
+  return section(
+    'Render',
+    h('p', { class: 'muted' }, `آخر تحديث ${relTime(x.fetchedAt)}. Render لا يتيح الفواتير عبر الـ API، لذلك تظهر هنا الخدمات وقواعد البيانات فقط.`),
+    listBlock(`الخدمات (${num(svcRows.length)})`, svcRows),
+    listBlock(`قواعد البيانات (${num(dbRows.length)})`, dbRows),
+    h('a', { class: 'btn btn-secondary btn-sm', href: 'https://dashboard.render.com/billing', target: '_blank', rel: 'noopener noreferrer' }, icon('external', 16), h('span', null, 'الفواتير في Render')),
+  );
+}
+
+async function renderRenewals(panel) {
+  panel.replaceChildren(loading());
+  let d = await api.get('/admin/renewals');
+  const draw = () => {
+    const items = renewalItems(d);
+    const soon = items.filter((x) => x.days !== null && x.days <= 30);
+    const refresh = button('تحديث الآن من Hostinger و Render', { kind: 'secondary', small: true, iconName: 'restore' });
+    refresh.addEventListener('click', async () => {
+      setBusy(refresh, true, 'جارٍ التحديث…');
+      try {
+        d = await api.get('/admin/renewals?refresh=1');
+        draw();
+        toast('تم تحديث بيانات التجديدات.');
+      } catch (ex) {
+        setBusy(refresh, false);
+        handleErr(ex);
+      }
+    });
+    const manual = items.filter((x) => x.source === 'entry');
+    panel.replaceChildren(
+      section(
+        'يحتاج تجديد خلال 30 يومًا',
+        soon.length ? h('ul', { class: 'people' }, soon.map(renewalRow)) : h('p', { class: 'muted' }, 'لا شيء ينتهي خلال الشهر القادم.'),
+        h('div', { class: 'row-gap' }, refresh),
+      ),
+      hostingerCard(d.hostinger),
+      renderCard(d.render),
+      section(
+        'تواريخ مسجّلة في الخزنة',
+        h('p', { class: 'muted' }, 'لأي شيء ليس على Hostinger أو Render (دومين عند شركة أخرى، اشتراك برنامج، باقة إعلانات…): افتح الحساب في الخزنة واملأ «تاريخ التجديد أو الانتهاء» في تفاصيل البرنامج.'),
+        manual.length ? h('ul', { class: 'people' }, manual.map(renewalRow)) : null,
+      ),
+    );
+    if ((d.hostinger && d.hostinger.loading) || (d.render && d.render.loading)) {
+      setTimeout(async () => {
+        if (!panel.isConnected) return;
+        try {
+          d = await api.get('/admin/renewals');
+          draw();
+        } catch {
+          /* keep the current view */
+        }
+      }, 4000);
+    }
+  };
+  draw();
+}
+
 async function renderDevices(panel) {
   panel.replaceChildren(loading());
   const d = await api.get('/admin/devices');
@@ -1664,7 +1951,17 @@ async function renderBackup(panel) {
       const toAdd = [];
       let skipped = 0;
       for (const it of Array.isArray(data.entries) ? data.entries : []) {
-        const meta = { client: String(it.client || '').trim(), platform: PLATFORMS.some((p) => p.id === it.platform) ? it.platform : 'other', platformName: it.platformName, label: it.label || '', username: it.username || '', url: it.url || '' };
+        const meta = {
+          client: String(it.client || '').trim(),
+          platform: PLATFORMS.some((p) => p.id === it.platform) ? it.platform : 'other',
+          platformName: it.platformName,
+          label: it.label || '',
+          username: it.username || '',
+          url: it.url || '',
+          hosting: it.hosting || undefined,
+          dbProvider: it.dbProvider || undefined,
+          renewAt: /^\d{4}-\d{2}-\d{2}$/.test(it.renewAt || '') ? it.renewAt : undefined,
+        };
         if (!meta.client) continue;
         if (existing.has(key(meta))) {
           skipped += 1;
@@ -1672,7 +1969,7 @@ async function renderBackup(panel) {
         }
         existing.add(key(meta));
         const id = vc.uuid();
-        const sealed = await vc.sealEntry(S.keys.vaultKey, id, S.keys.keyVersion, meta, { password: it.password || '', notes: it.notes || '', history: Array.isArray(it.history) ? it.history : [] });
+        const sealed = await vc.sealEntry(S.keys.vaultKey, id, S.keys.keyVersion, meta, { password: it.password || '', notes: it.notes || '', history: Array.isArray(it.history) ? it.history : [], dbUrl: it.dbUrl || undefined });
         toAdd.push({ id, ...sealed });
       }
       let added = 0;

@@ -17,6 +17,7 @@ const SECRET = crypto.randomBytes(32).toString('base64');
 process.env.MASTER_SECRET = SECRET;
 
 const vc = await import(path.join(root, 'public/js/vcrypto.js'));
+const { startMockApis } = await import(path.join(root, 'test/mock_apis.mjs'));
 const sec = await import(path.join(root, 'src/sec.js'));
 const ITER = 600_000;
 
@@ -176,8 +177,15 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
   await admin.end();
   const db = new pg.Client({ connectionString: DB });
 
-  const srv = await startServer();
+  const mock = await startMockApis({ hostingerToken: 'h-test-token', renderToken: 'r-test-token' });
+  const srv = await startServer({
+    HOSTINGER_API_TOKEN: 'h-test-token',
+    RENDER_API_KEY: 'r-test-token',
+    HOSTINGER_API_BASE: `http://127.0.0.1:${mock.port}`,
+    RENDER_API_BASE: `http://127.0.0.1:${mock.port}/v1`,
+  });
   assert.ok(srv.ok, srv.log());
+  t.after(() => mock.close());
   await db.connect();
   t.after(async () => {
     srv.child.kill('SIGTERM');
@@ -301,6 +309,32 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     assert.equal((await db.query("SELECT count(*)::int AS n FROM audit WHERE action = 'x'")).rows[0].n, 0);
   });
 
+  await t.test('renewals come from Hostinger and Render with read-only calls', async () => {
+    const r = await A.api('GET', '/admin/renewals?refresh=1');
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.hostinger.domains.length, 3);
+    assert.equal(r.data.hostinger.subscriptions.find((x) => x.id === 'sub-1').renewalPrice, 155.88);
+    assert.equal(r.data.render.services.length, 2);
+    assert.ok(r.data.render.databases.find((x) => x.name === 'star-style-db').expiresAt);
+    assert.ok(!JSON.stringify(r.data).includes('test-token'), 'tokens never reach the browser');
+    assert.ok(mock.calls.length >= 4);
+    for (const c of mock.calls) {
+      assert.equal(c.method, 'GET');
+      assert.ok(c.auth === 'Bearer h-test-token' || c.auth === 'Bearer r-test-token');
+    }
+    const st = await A.api('GET', '/admin/status');
+    const names = st.data.renewals.map((x) => x.title);
+    for (const n of ['star-style-db', 'starstyle.com', 'Business Web Hosting', 'old-client.com']) assert.ok(names.includes(n), n);
+    for (const n of ['nilefoods.net', '.com Domain']) assert.ok(!names.includes(n), n);
+    assert.equal(st.data.renewals[0].title, 'old-client.com', 'already expired comes first');
+
+    process.env.HOSTINGER_API_BASE = `http://127.0.0.1:${mock.port}`;
+    process.env.RENDER_API_BASE = `http://127.0.0.1:${mock.port}/v1`;
+    const integ = await import(path.join(root, 'src/integrations.js'));
+    await assert.rejects(integ.hostingerSnapshot('wrong-token'), (e) => e.code === 'auth');
+    await assert.rejects(integ.renderSnapshot('wrong-token'), (e) => e.code === 'auth');
+  });
+
   await t.test('unknown users get a stable fake salt', async () => {
     const a = await stranger.api('POST', '/auth/prelogin', { username: 'nobody' });
     assert.equal(a.status, 404, 'stranger still blocked');
@@ -363,6 +397,7 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     assert.equal(list2.entries.filter((e) => e.client === 'Star Style').length, 2);
     const forbidden = await B.api('GET', '/admin/users');
     assert.equal(forbidden.status, 403);
+    assert.equal((await B.api('GET', '/admin/renewals')).status, 403);
   });
 
   await t.test('TOTP codes cannot be replayed and wrong codes fail', async () => {

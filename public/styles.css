@@ -123,7 +123,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field > label { font-weight: 600; font-size: 15px; }
 .hint { font-size: 13px; color: var(--steel-600); }
-input[type='text'], input[type='password'], input[type='search'], input[type='file'], select, textarea {
+input[type='text'], input[type='password'], input[type='search'], input[type='file'], input[type='date'], select, textarea {
   width: 100%;
   min-height: 48px;
   padding: 10px 14px;
@@ -348,6 +348,12 @@ input[dir='ltr']::placeholder { text-align: left; }
 .row-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .plat { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
 .row-label { font-size: 14px; color: var(--steel-600); overflow-wrap: anywhere; }
+.row-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.row-tags .tag { font-weight: 500; }
+details.tech { border: 1px solid var(--steel-200); border-radius: var(--radius); padding: 12px 14px; background: var(--steel-50); }
+details.tech > summary { cursor: pointer; font-weight: 600; color: var(--steel-700); }
+details.tech[open] > summary { margin-bottom: 12px; }
+.card details.tech { background: var(--paper); }
 .cred { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .cred-k { flex: none; min-width: 84px; font-size: 13px; color: var(--steel-600); }
 .cred-v { flex: 1; min-width: 0; font-size: 15px; overflow-wrap: anywhere; text-align: left; }

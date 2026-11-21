@@ -14,6 +14,10 @@ export const DB_PLAN = (env.DB_PLAN || '').trim().toLowerCase();
 export const PUBLIC_URL = (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
 export const COOKIE_SECURE = env.COOKIE_SECURE ? env.COOKIE_SECURE === 'true' : IS_PROD;
 
+// Optional read-only connections for renewal reminders (set them in Render → Environment).
+export const HOSTINGER_API_TOKEN = (env.HOSTINGER_API_TOKEN || '').trim();
+export const RENDER_API_KEY = (env.RENDER_API_KEY || '').trim();
+
 export const SESSION_IDLE_MS = 30 * 60 * 1000; // server-side idle timeout
 export const SESSION_MAX_MS = 12 * 60 * 60 * 1000; // absolute session lifetime
 export const INVITE_TTL_MS = 72 * 60 * 60 * 1000;

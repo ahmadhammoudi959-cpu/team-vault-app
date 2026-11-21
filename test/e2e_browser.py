@@ -48,7 +48,7 @@ def shot(page, name, full=True):
     page.screenshot(path=f'{SHOTS}/{name}.png', full_page=full)
 
 
-def add_entry(page, client, platform, label, username, password=None, notes=''):
+def add_entry(page, client, platform, label, username, password=None, notes='', tech=None):
     page.get_by_role('button', name='إضافة حساب', exact=True).click()
     dlg = page.locator('dialog[open]')
     dlg.get_by_label('العميل').fill(client)
@@ -61,6 +61,14 @@ def add_entry(page, client, platform, label, username, password=None, notes=''):
         dlg.get_by_role('button', name='توليد كلمة سر قوية').click()
     if notes:
         dlg.get_by_label('ملاحظات سرية (اختياري)').fill(notes)
+    if tech:
+        details = dlg.locator('details.tech')
+        if details.get_attribute('open') is None:
+            details.locator('summary').click()
+        dlg.get_by_label('مكان الاستضافة').fill(tech['hosting'])
+        dlg.get_by_label('مكان قاعدة البيانات').fill(tech['db'])
+        dlg.get_by_label('رابط قاعدة البيانات (سري ومشفر)').fill(tech['dbUrl'])
+        dlg.get_by_label('تاريخ التجديد أو الانتهاء').fill(tech['renewAt'])
     dlg.get_by_role('button', name='حفظ الحساب').click()
     expect(page.locator('dialog[open]')).to_have_count(0, timeout=15000)
 
@@ -106,9 +114,20 @@ with sync_playwright() as p:
     add_entry(page, 'Nile Foods', 'tiktok', '', 'nilefoods.official')
     add_entry(page, 'Nile Foods', 'instagram', '@nilefoods', 'nilefoods')
     add_entry(page, 'مطعم الكورنيش', 'google', 'Gmail', 'corniche.rest@gmail.com')
-    add_entry(page, 'Cairo Gym', 'website', 'لوحة تحكم الموقع', 'admin')
+    renew_at = time.strftime('%Y-%m-%d', time.localtime(time.time() + 12 * 86400))
+    add_entry(page, 'Cairo Gym', 'website', 'لوحة تحكم الموقع', 'admin',
+              tech={'hosting': 'Hostinger', 'db': 'Neon', 'dbUrl': 'postgresql://gym:S3cret@ep-x.neon.tech/gym', 'renewAt': renew_at})
+    gym = page.locator('.row').filter(has_text='لوحة تحكم الموقع')
+    expect(gym.locator('.row-tags')).to_contain_text('Hostinger')
+    expect(gym.locator('.row-tags')).to_contain_text('Neon')
+    expect(gym.locator('.row-tags')).to_contain_text('12')
+    gym.get_by_role('button', name='إظهار').click()
+    expect(gym.locator('.row-extra')).to_contain_text('postgresql://gym:S3cret@ep-x.neon.tech/gym')
+    shot(page, '04b-program-details')
+    gym.get_by_role('button', name='إخفاء').click()
     page.get_by_role('button', name='كل العملاء').click()
     expect(page.locator('.box')).to_have_count(4)
+    expect(page.locator('.banner').filter(has_text='خلال 30 يومًا')).to_be_visible(timeout=15000)
     shot(page, '04-client-wall')
 
     # ---------- search by client name (Arabic and English, typos in hamza) ----------
@@ -225,6 +244,13 @@ with sync_playwright() as p:
     expect(page.locator('.log')).to_contain_text('نسخ كلمة سر')
     expect(page.locator('.log')).to_contain_text('طلب دخول من جهاز جديد')
     shot(page, '15-admin-audit')
+
+    page.get_by_role('tab', name='التجديدات').click()
+    soon = page.locator('.card').filter(has_text='يحتاج تجديد خلال 30 يومًا')
+    for name in ['old-client.com', 'star-style-db', 'starstyle.com', 'Business Web Hosting', 'Cairo Gym']:
+        expect(soon).to_contain_text(name, timeout=15000)
+    expect(soon).not_to_contain_text('nilefoods.net')
+    shot(page, '15b-admin-renewals')
 
     page.get_by_role('tab', name='النسخ الاحتياطي').click()
     page.get_by_label('كلمة سر النسخة الاحتياطية', exact=True).first.fill('Backup-Pass-2026-OK!')

@@ -63,6 +63,7 @@ const ICONS = {
   restore: [['path', { d: 'M4 12a8 8 0 1 0 2.4-5.7M4 4v4.5h4.5' }]],
   back: [['path', { d: 'M10 6l6 6-6 6' }]],
   link: [['path', { d: 'M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1' }]],
+  calendar: [['rect', { x: 3.5, y: 5, width: 17, height: 15.5, rx: 2 }], ['path', { d: 'M3.5 10h17M8 3v4M16 3v4M8 14h2M14 14h2M8 17h2' }]],
 };
 
 export function icon(name, size = 20) {
