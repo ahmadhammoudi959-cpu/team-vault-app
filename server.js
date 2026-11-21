@@ -213,7 +213,10 @@ app.use(
     dotfiles: 'ignore',
     etag: false,
     lastModified: false,
-    setHeaders: (res) => res.setHeader('Cache-Control', 'no-store'),
+    setHeaders: (res, filePath) => {
+      // Fonts never change and hold nothing sensitive; everything else is always re-fetched.
+      res.setHeader('Cache-Control', filePath.endsWith('.woff2') ? 'private, max-age=31536000, immutable' : 'no-store');
+    },
   }),
 );
 

@@ -600,9 +600,11 @@ async function showRegister(code) {
         secret: r.secret,
         submitLabel: 'تفعيل وإنهاء التسجيل',
         onCode: (totp) => api.post('/register/finish', { inviteCode: code, totp }),
-        after: (r2) => {
+        after: async () => {
           history.replaceState(null, '', '/');
-          showMemberPending(r2.fingerprint, info.username);
+          // Computed here from the key this browser generated, not taken from the server,
+          // so a tampered server can't show a matching fingerprint for a swapped key.
+          showMemberPending(await vc.fingerprint(keys.publicKey), info.username);
         },
       });
     },
