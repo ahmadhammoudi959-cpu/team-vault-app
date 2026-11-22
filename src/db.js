@@ -187,6 +187,10 @@ CREATE TABLE IF NOT EXISTS notice_reads (
   PRIMARY KEY (user_id, key)
 );
 
+-- Sign-in is username + master password only (no authenticator app): drop the old 2FA secrets.
+UPDATE users SET totp_enabled = false, totp_secret = NULL, totp_pending = NULL, totp_last_step = 0
+ WHERE totp_enabled OR totp_secret IS NOT NULL OR totp_pending IS NOT NULL;
+
 -- The activity log is append-only: the database itself ignores edits and deletes.
 CREATE OR REPLACE RULE audit_no_update AS ON UPDATE TO audit DO INSTEAD NOTHING;
 CREATE OR REPLACE RULE audit_no_delete AS ON DELETE TO audit DO INSTEAD NOTHING;

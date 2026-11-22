@@ -22,43 +22,7 @@ const sec = await import(path.join(root, 'src/sec.js'));
 const ITER = 600_000;
 
 // ---------- helpers ----------
-function b32decode(s) {
-  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  const clean = s.replace(/\s+/g, '').toUpperCase();
-  let bits = 0;
-  let value = 0;
-  const out = [];
-  for (const ch of clean) {
-    value = (value << 5) | A.indexOf(ch);
-    bits += 5;
-    if (bits >= 8) {
-      out.push((value >>> (bits - 8)) & 255);
-      bits -= 8;
-    }
-    value &= (1 << bits) - 1;
-  }
-  return Buffer.from(out);
-}
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Returns a TOTP code for a step the server hasn't seen yet (waits for the clock if needed).
-class Authenticator {
-  constructor(secretText) {
-    this.secret = b32decode(secretText);
-    this.last = 0;
-  }
-  async code() {
-    let now = Math.floor(Date.now() / 30_000);
-    let step = Math.max(this.last + 1, now - 1);
-    while (step > now + 1) {
-      await sleep(1000);
-      now = Math.floor(Date.now() / 30_000);
-    }
-    this.last = step;
-    return sec.hotp(this.secret, step);
-  }
-}
 
 let ipCounter = 10;
 class Client {
@@ -138,10 +102,11 @@ async function registerKeys(password) {
   return { salt, authKey, kek, ...keys };
 }
 
-async function login(client, username, password, auth) {
+// Sign-in is username + master password only.
+async function login(client, username, password) {
   const pre = await client.api('POST', '/auth/prelogin', { username });
   const { authKey, kek } = await vc.deriveFromPassword(password, pre.data.kdfSalt, pre.data.kdfIter);
-  const r = await client.api('POST', '/auth/login', { username, authKey, totp: auth ? await auth.code() : '000000' });
+  const r = await client.api('POST', '/auth/login', { username, authKey });
   return { ...r, kek };
 }
 
@@ -198,7 +163,6 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
   const stranger = new Client();
   const A = new Client(); // admin's laptop
   let adminVault;
-  let adminAuth;
   const adminPw = 'Correct-Horse-Battery-77!';
 
   await t.test('strangers see nothing but 404', async () => {
@@ -229,14 +193,14 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
       authKey: k.authKey, publicKey: k.publicKey, encPrivateKey: k.encPrivateKey, wrappedVaultKey: wrapped,
     });
     assert.equal(s1.status, 200, JSON.stringify(s1.data));
-    assert.match(s1.data.qr, /^data:image\/svg\+xml;base64,/);
-    adminAuth = new Authenticator(s1.data.secret);
-    const bad = await A.api('POST', '/setup/finish', { username: 'owner', totp: '123456' });
-    assert.equal(bad.status, 400);
-    const s2 = await A.api('POST', '/setup/finish', { username: 'owner', totp: await adminAuth.code() });
-    assert.equal(s2.status, 200, JSON.stringify(s2.data));
-    assert.equal(s2.data.status, 'ok');
-    adminVault = await openVault(s2, k.kek);
+    assert.equal(s1.data.status, 'ok', 'no authenticator step: straight into the vault');
+    assert.equal(s1.data.qr, undefined);
+    adminVault = await openVault(s1, k.kek);
+    const twice = await A.api('POST', '/setup/start', {
+      userId: vc.uuid(), username: 'owner2', displayName: 'x', kdfSalt: k.salt, kdfIter: ITER,
+      authKey: k.authKey, publicKey: k.publicKey, encPrivateKey: k.encPrivateKey, wrappedVaultKey: wrapped,
+    });
+    assert.equal(twice.status, 404, 'setup happens once');
     const again = await stranger.raw('GET', `/setup/${setupToken}`);
     assert.equal(again.status, 404, 'setup link must die after setup');
   });
@@ -294,7 +258,8 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     }
     const u = (await db.query("SELECT * FROM users WHERE username = 'owner'")).rows[0];
     assert.match(u.enc_private_key, /^s1\./);
-    assert.match(u.totp_secret, /^s1\./);
+    assert.equal(u.totp_secret, null, 'no authenticator secret is stored');
+    assert.equal(u.totp_enabled, false);
     assert.ok(!JSON.stringify(u).includes(adminPw));
     // Peeling the server layer still leaves browser-encrypted data.
     const meta = sec.srvDec(`entry-meta:${igId}`, (await db.query('SELECT meta_ct FROM entries WHERE id = $1', [igId])).rows[0].meta_ct);
@@ -407,7 +372,6 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
   // ---- team member flow ----
   const B = new Client(); // member's laptop
   const memberPw = 'Member-Strong-Pass-2026';
-  let memberAuth;
   let memberId;
   let gate;
   await t.test('invite → register → waits for approval', async () => {
@@ -428,14 +392,12 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     const k = await registerKeys(memberPw);
     const r1 = await B.api('POST', '/register/start', { inviteCode: code, userId: memberId, kdfSalt: k.salt, kdfIter: ITER, authKey: k.authKey, publicKey: k.publicKey, encPrivateKey: k.encPrivateKey });
     assert.equal(r1.status, 200, JSON.stringify(r1.data));
-    memberAuth = new Authenticator(r1.data.secret);
-    const r2 = await B.api('POST', '/register/finish', { inviteCode: code, totp: await memberAuth.code() });
-    assert.equal(r2.data.status, 'pending_approval');
-    assert.equal(r2.data.fingerprint, await vc.fingerprint(k.publicKey));
+    assert.equal(r1.data.status, 'pending_approval', 'password only, then the admin approves');
+    assert.equal(r1.data.fingerprint, await vc.fingerprint(k.publicKey));
     const reuse = await B.api('POST', '/register/info', { inviteCode: code });
     assert.equal(reuse.status, 404, 'invite is single-use');
 
-    const early = await login(B, 'ahmed', memberPw, memberAuth);
+    const early = await login(B, 'ahmed', memberPw);
     assert.equal(early.data.status, 'pending_approval');
   });
 
@@ -450,7 +412,7 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     const ap = await A.api('POST', `/admin/users/${m.id}/approve`, { keyVersion: adminVault.keyVersion, wrapped });
     assert.equal(ap.status, 200, JSON.stringify(ap.data));
 
-    const r = await login(B, 'ahmed', memberPw, memberAuth);
+    const r = await login(B, 'ahmed', memberPw);
     assert.equal(r.data.status, 'ok', JSON.stringify(r.data));
     const mv = await openVault(r, r.kek);
     const list2 = await listEntries(B, mv);
@@ -462,28 +424,31 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     assert.equal((await B.api('POST', '/admin/notices/read', { keys: [] })).status, 403);
   });
 
-  await t.test('TOTP codes cannot be replayed and wrong codes fail', async () => {
+  await t.test('sign-in is username and password only; the old 2FA routes are gone', async () => {
     const C = new Client();
     await C.raw('GET', gate);
-    const code = sec.hotp(memberAuth.secret, memberAuth.last);
-    const pre = await C.api('POST', '/auth/prelogin', { username: 'ahmed' });
-    const { authKey } = await vc.deriveFromPassword(memberPw, pre.data.kdfSalt, pre.data.kdfIter);
-    const replay = await C.api('POST', '/auth/login', { username: 'ahmed', authKey, totp: code });
-    assert.equal(replay.status, 401);
+    const wrong = await login(C, 'ahmed', 'Not-The-Right-Password-1');
+    assert.equal(wrong.status, 401);
+    assert.equal(wrong.data.error, 'bad_credentials');
+    for (const p of ['/setup/finish', '/auth/totp-setup', '/register/finish']) assert.equal((await C.api('POST', p, {})).status, 404, p);
+    const list = await A.api('GET', '/admin/users');
+    assert.ok(list.data.users.every((u) => !('totpEnabled' in u)));
+    const reset = await A.api('POST', `/admin/users/${memberId}/reset-totp`, {});
+    assert.equal(reset.status, 404);
     await db.query("UPDATE users SET failed_logins = 0 WHERE username = 'ahmed'");
   });
 
   const C = new Client(); // member's phone (new device)
   await t.test('a new device needs admin approval; blocking it locks it out', async () => {
     assert.equal((await C.raw('GET', gate)).status, 302);
-    const r = await login(C, 'ahmed', memberPw, memberAuth);
+    const r = await login(C, 'ahmed', memberPw);
     assert.equal(r.data.status, 'device_pending');
     const devs = await A.api('GET', '/admin/devices');
     const pending = devs.data.devices.find((d) => d.status === 'pending' && d.username === 'ahmed');
     assert.ok(pending);
     const ap = await A.api('POST', '/admin/devices/approve', { userId: pending.userId, deviceId: pending.deviceId });
     assert.equal(ap.status, 200);
-    const r2 = await login(C, 'ahmed', memberPw, memberAuth);
+    const r2 = await login(C, 'ahmed', memberPw);
     assert.equal(r2.data.status, 'ok');
     assert.equal((await C.api('GET', '/entries')).status, 200);
 
@@ -499,10 +464,10 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     const D = new Client();
     await D.raw('GET', gate);
     for (let i = 0; i < 5; i++) {
-      const r = await login(D, 'ahmed', 'wrong-password-xx', null);
+      const r = await login(D, 'ahmed', 'wrong-password-xx');
       assert.equal(r.status, 401);
     }
-    const locked = await login(D, 'ahmed', memberPw, null);
+    const locked = await login(D, 'ahmed', memberPw);
     assert.equal(locked.status, 423);
     assert.ok(locked.data.minutes >= 1);
     const ul = await A.api('POST', `/admin/users/${memberId}/unlock`, {});
@@ -550,7 +515,7 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
 
     const gone = await B.api('GET', '/entries');
     assert.equal(gone.status, 401, 'removed member session is dead');
-    const relog = await login(B, 'ahmed', memberPw, null);
+    const relog = await login(B, 'ahmed', memberPw);
     assert.equal(relog.status, 401);
 
     // Admin re-unlocks and reads everything with the new key.
@@ -612,6 +577,18 @@ test('vault end-to-end', { timeout: 15 * 60_000 }, async (t) => {
     const ok = await A.api('POST', '/auth/unlock', { authKey: n2.authKey });
     assert.equal(ok.status, 200);
     await openVault(ok, n2.kek);
+  });
+
+  await t.test('old authenticator secrets are dropped when the server starts', async () => {
+    await db.query("UPDATE users SET totp_enabled = true, totp_secret = 's1.old', totp_pending = 's1.old2', totp_last_step = 99 WHERE username = 'owner'");
+    srv.child.kill('SIGTERM');
+    await sleep(500);
+    const again = await startServer();
+    assert.equal(again.ok, true, again.log());
+    const u = (await db.query("SELECT totp_enabled, totp_secret, totp_pending, totp_last_step FROM users WHERE username = 'owner'")).rows[0];
+    assert.deepEqual({ ...u, totp_last_step: Number(u.totp_last_step) }, { totp_enabled: false, totp_secret: null, totp_pending: null, totp_last_step: 0 });
+    again.child.kill('SIGTERM');
+    await sleep(500);
   });
 
   await t.test('server refuses to start with a different MASTER_SECRET', async () => {

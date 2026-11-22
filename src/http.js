@@ -65,11 +65,6 @@ export const v = {
     if (!w || w.v !== 1 || !B64.test(w.epk || '') || !B64.test(w.salt || '') || !BLOB.test(w.ct || '')) throw bad('wrapped');
     return s;
   },
-  totp(s) {
-    const c = String(s ?? '').replace(/\s+/g, '');
-    if (!/^\d{6}$/.test(c)) throw bad('totp');
-    return c;
-  },
   int(n, min, max, field = 'number') {
     if (!Number.isInteger(n) || n < min || n > max) throw bad(field);
     return n;

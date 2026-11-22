@@ -5,14 +5,13 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import QRCode from 'qrcode';
 import * as cfg from './src/config.js';
 import {
   initPool, migrate, q, tx, getSetting, setSetting, clearSettingsCache, lockVault, bumpRevision,
 } from './src/db.js';
 import {
   randomToken, hashToken, safeEqual, srvEnc, srvDec, gateToken, setupToken, keyCheck, fakeSalt,
-  hashAuth, verifyAuth, dummyAuth, base32, newTotpSecret, checkTotp, fingerprint,
+  hashAuth, verifyAuth, dummyAuth, fingerprint,
 } from './src/sec.js';
 import {
   HttpError, v, parseCookies, cookieName, setCookie, clearCookie, clientIp, deviceLabel, hit,
@@ -108,16 +107,6 @@ async function isSetupDone() {
   return setupDone;
 }
 
-const totpSecretOf = (u) => Buffer.from(srvDec(`totp:${u.id}`, u.totp_secret), 'base64');
-
-async function totpPayload(username, secretBuf) {
-  const b32 = base32(secretBuf);
-  const label = `${encodeURIComponent(cfg.TOTP_ISSUER)}:${encodeURIComponent(username)}`;
-  const uri = `otpauth://totp/${label}?secret=${b32}&issuer=${encodeURIComponent(cfg.TOTP_ISSUER)}&algorithm=SHA1&digits=6&period=30`;
-  const svg = await QRCode.toString(uri, { type: 'svg', errorCorrectionLevel: 'M', margin: 2, color: { dark: '#17222b', light: '#ffffff' } });
-  return { qr: `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`, secret: b32.match(/.{1,4}/g).join(' ') };
-}
-
 async function keysPayload(userId) {
   const u = (await q('SELECT id, username, display_name, role, public_key, enc_private_key FROM users WHERE id = $1', [userId])).rows[0];
   const kv = Number(await getSetting('key_version'));
@@ -147,26 +136,6 @@ async function registerFailure(req, u, reason) {
   if (lockMin) await audit(req, 'account_locked', { userId: u.id, username: u.username, details: { minutes: lockMin } });
   return lockMin;
 }
-
-const tickets = new Map();
-function newTicket(data) {
-  const t = randomToken(24);
-  tickets.set(t, { ...data, exp: Date.now() + 10 * MIN, tries: 0 });
-  return t;
-}
-function getTicket(t) {
-  const x = typeof t === 'string' ? tickets.get(t) : null;
-  if (!x) return null;
-  if (x.exp < Date.now()) {
-    tickets.delete(t);
-    return null;
-  }
-  return x;
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, x] of tickets) if (x.exp < now) tickets.delete(k);
-}, MIN).unref();
 
 function originOf(req) {
   const host = req.get('host');
@@ -348,6 +317,7 @@ api.get('/state', async (req, res) => {
   });
 });
 
+// The first admin: account, vault key and this device, in one step.
 api.post('/setup/start', rateLimit('setup', 15, 15 * MIN), async (req, res) => {
   if ((await isSetupDone()) || !req.device.setup_allowed) throw new HttpError(404, 'not_found');
   const b = req.body || {};
@@ -362,55 +332,37 @@ api.post('/setup/start', rateLimit('setup', 15, 15 * MIN), async (req, res) => {
   const wrapped = v.wrap(b.wrappedVaultKey);
   const authSalt = crypto.randomBytes(16);
   const authHash = await hashAuth(authKey, authSalt);
-  const totp = newTotpSecret();
   await tx(async (c) => {
+    const ins = await c.query("INSERT INTO settings (key, value) VALUES ('setup_done', '1') ON CONFLICT (key) DO NOTHING RETURNING key");
+    if (!ins.rowCount) throw new HttpError(404, 'not_found');
     await c.query("DELETE FROM users WHERE status = 'pending_totp'");
     await c.query(
       `INSERT INTO users (id, username, display_name, role, status, kdf_salt, kdf_iter, auth_hash, auth_salt,
-                          public_key, enc_private_key, totp_secret)
-       VALUES ($1,$2,$3,'admin','pending_totp',$4,$5,$6,$7,$8,$9,$10)`,
+                          public_key, enc_private_key, approved_at, last_login_at)
+       VALUES ($1,$2,$3,'admin','active',$4,$5,$6,$7,$8,$9, now(), now())`,
       [id, username, displayName, kdfSalt, kdfIter, authHash.toString('base64'), authSalt.toString('base64'),
-        publicKey, srvEnc(`privkey:${id}`, encPrivateKey), srvEnc(`totp:${id}`, totp.toString('base64'))],
+        publicKey, srvEnc(`privkey:${id}`, encPrivateKey)],
     );
     await c.query('INSERT INTO vault_keys (user_id, key_version, wrapped, created_by) VALUES ($1, 1, $2, $1)', [
       id, srvEnc(`wrap:${id}:1`, wrapped),
     ]);
-  });
-  res.json(await totpPayload(username, totp));
-});
-
-api.post('/setup/finish', rateLimit('setup', 15, 15 * MIN), async (req, res) => {
-  if ((await isSetupDone()) || !req.device.setup_allowed) throw new HttpError(404, 'not_found');
-  const username = v.username(req.body?.username);
-  const code = v.totp(req.body?.totp);
-  const u = (await q("SELECT * FROM users WHERE username = $1 AND status = 'pending_totp' AND role = 'admin'", [username])).rows[0];
-  if (!u) throw new HttpError(400, 'setup_restart');
-  const step = checkTotp(totpSecretOf(u), code, Number(u.totp_last_step));
-  if (step === null) throw new HttpError(400, 'bad_totp');
-  await tx(async (c) => {
-    const ins = await c.query("INSERT INTO settings (key, value) VALUES ('setup_done', '1') ON CONFLICT (key) DO NOTHING RETURNING key");
-    if (!ins.rowCount) throw new HttpError(404, 'not_found');
-    await c.query(
-      "UPDATE users SET status = 'active', totp_enabled = true, totp_last_step = $2, approved_at = now(), last_login_at = now() WHERE id = $1",
-      [u.id, step],
-    );
     await c.query(
       `INSERT INTO user_devices (user_id, device_id, status, decided_by, decided_at, last_used_at, last_ip)
        VALUES ($1, $2, 'approved', $1, now(), now(), $3)`,
-      [u.id, req.device.id, clientIp(req)],
+      [id, req.device.id, clientIp(req)],
     );
     await c.query('UPDATE devices SET setup_allowed = false WHERE id = $1', [req.device.id]);
-    await createSession(c, res, u.id, req.device.id, req);
+    await createSession(c, res, id, req.device.id, req);
   });
   setupDone = true;
   clearSettingsCache();
   forgetDevices();
-  await audit(req, 'setup_complete', { userId: u.id, username: u.username });
-  res.json({ status: 'ok', ...(await keysPayload(u.id)) });
+  await audit(req, 'setup_complete', { userId: id, username });
+  res.json({ status: 'ok', ...(await keysPayload(id)) });
 });
 
 // ---------------------------------------------------------------------------
-// login, 2FA, device approval, unlock
+// login (username + master password), device approval, unlock
 // ---------------------------------------------------------------------------
 api.post('/auth/prelogin', rateLimit('prelogin', 40, 15 * MIN), async (req, res) => {
   const username = v.usernameLoose(req.body?.username);
@@ -461,7 +413,6 @@ api.post('/auth/login', rateLimit('login', 12, 15 * MIN), async (req, res) => {
   const b = req.body || {};
   const username = v.usernameLoose(b.username);
   const authKey = v.isAuthKey(b.authKey) ? b.authKey : null;
-  const code = String(b.totp ?? '').replace(/\s+/g, '');
   const u = username ? (await q('SELECT * FROM users WHERE username = $1', [username])).rows[0] : null;
   if (!u || !authKey || !['active', 'pending_approval'].includes(u.status)) {
     await dummyAuth();
@@ -473,45 +424,15 @@ api.post('/auth/login', rateLimit('login', 12, 15 * MIN), async (req, res) => {
     throw new HttpError(423, 'locked', { minutes: Math.ceil((new Date(u.locked_until).getTime() - Date.now()) / MIN) });
   }
   const passOk = await verifyAuth(u, authKey);
-  const recovery = !!cfg.RECOVERY_USER && cfg.RECOVERY_USER === u.username;
-  const needTotp = u.totp_enabled && !recovery;
-  const step = passOk && needTotp ? checkTotp(totpSecretOf(u), code, Number(u.totp_last_step)) : null;
-  if (!passOk || (needTotp && step === null)) {
-    await registerFailure(req, u, passOk ? 'bad_totp' : 'bad_password');
+  if (!passOk) {
+    await registerFailure(req, u, 'bad_password');
     throw new HttpError(401, 'bad_credentials');
   }
-  await q('UPDATE users SET failed_logins = 0, locked_until = NULL, totp_last_step = GREATEST(totp_last_step, $2) WHERE id = $1', [u.id, step ?? 0]);
-  if (!needTotp) {
-    // 2FA was reset by an admin, or RECOVERY_USER is set: enrol a new authenticator first.
-    const secret = newTotpSecret();
-    await q('UPDATE users SET totp_pending = $2 WHERE id = $1', [u.id, srvEnc(`totp-pending:${u.id}`, secret.toString('base64'))]);
-    if (recovery) await audit(req, 'recovery_login', { userId: u.id, username: u.username });
-    const ticket = newTicket({ userId: u.id, deviceId: req.device.id, recovery });
-    return res.json({ status: 'totp_setup', ticket, ...(await totpPayload(u.username, secret)) });
-  }
-  await finishLogin(req, res, u, false);
-});
-
-api.post('/auth/totp-setup', rateLimit('login', 12, 15 * MIN), async (req, res) => {
-  const t = getTicket(req.body?.ticket);
-  if (!t || t.deviceId !== req.device.id) throw new HttpError(400, 'ticket_expired');
-  const code = v.totp(req.body?.totp);
-  const u = (await q('SELECT * FROM users WHERE id = $1', [t.userId])).rows[0];
-  if (!u || !u.totp_pending) throw new HttpError(400, 'ticket_expired');
-  const secret = Buffer.from(srvDec(`totp-pending:${u.id}`, u.totp_pending), 'base64');
-  const step = checkTotp(secret, code, 0);
-  if (step === null) {
-    t.tries += 1;
-    if (t.tries >= 5) tickets.delete(req.body.ticket);
-    throw new HttpError(400, 'bad_totp');
-  }
-  tickets.delete(req.body.ticket);
-  await q('UPDATE users SET totp_secret = $2, totp_pending = NULL, totp_enabled = true, totp_last_step = $3 WHERE id = $1', [
-    u.id, srvEnc(`totp:${u.id}`, secret.toString('base64')), step,
-  ]);
-  await audit(req, 'totp_enrolled', { userId: u.id, username: u.username });
-  const fresh = (await q('SELECT * FROM users WHERE id = $1', [u.id])).rows[0];
-  await finishLogin(req, res, fresh, t.recovery);
+  await q('UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = $1', [u.id]);
+  // RECOVERY_USER (set only in an emergency) lets that admin in on a new device without approval.
+  const recovery = !!cfg.RECOVERY_USER && cfg.RECOVERY_USER === u.username;
+  if (recovery) await audit(req, 'recovery_login', { userId: u.id, username: u.username });
+  await finishLogin(req, res, u, recovery);
 });
 
 api.post('/auth/unlock', requireSession, rateLimit('unlock', 12, 15 * MIN), async (req, res) => {
@@ -573,42 +494,26 @@ api.post('/register/start', rateLimit('register', 30, 15 * MIN), async (req, res
   const encPrivateKey = v.blob(b.encPrivateKey, 4096, 'encPrivateKey');
   const authSalt = crypto.randomBytes(16);
   const authHash = await hashAuth(authKey, authSalt);
-  const totp = newTotpSecret();
   await tx(async (c) => {
     if (inv.user_id) await c.query("DELETE FROM users WHERE id = $1 AND status = 'pending_totp'", [inv.user_id]);
     const taken = await c.query('SELECT 1 FROM users WHERE username = $1', [inv.username]);
     if (taken.rowCount) throw new HttpError(409, 'username_taken');
     await c.query(
       `INSERT INTO users (id, username, display_name, role, status, kdf_salt, kdf_iter, auth_hash, auth_salt,
-                          public_key, enc_private_key, totp_secret)
-       VALUES ($1,$2,$3,$4,'pending_totp',$5,$6,$7,$8,$9,$10,$11)`,
+                          public_key, enc_private_key)
+       VALUES ($1,$2,$3,$4,'pending_approval',$5,$6,$7,$8,$9,$10)`,
       [id, inv.username, inv.display_name, inv.role, kdfSalt, kdfIter, authHash.toString('base64'), authSalt.toString('base64'),
-        publicKey, srvEnc(`privkey:${id}`, encPrivateKey), srvEnc(`totp:${id}`, totp.toString('base64'))],
+        publicKey, srvEnc(`privkey:${id}`, encPrivateKey)],
     );
-    await c.query('UPDATE invites SET user_id = $2 WHERE id = $1', [inv.id, id]);
-  });
-  res.json(await totpPayload(inv.username, totp));
-});
-
-api.post('/register/finish', rateLimit('register', 30, 15 * MIN), async (req, res) => {
-  const inv = await findInvite(req.body?.inviteCode);
-  if (!inv || !inv.user_id) throw new HttpError(404, 'invite_invalid');
-  const code = v.totp(req.body?.totp);
-  const u = (await q("SELECT * FROM users WHERE id = $1 AND status = 'pending_totp'", [inv.user_id])).rows[0];
-  if (!u) throw new HttpError(404, 'invite_invalid');
-  const step = checkTotp(totpSecretOf(u), code, 0);
-  if (step === null) throw new HttpError(400, 'bad_totp');
-  await tx(async (c) => {
-    await c.query("UPDATE users SET status = 'pending_approval', totp_enabled = true, totp_last_step = $2 WHERE id = $1", [u.id, step]);
-    await c.query('UPDATE invites SET used_at = now() WHERE id = $1', [inv.id]);
+    await c.query('UPDATE invites SET user_id = $2, used_at = now() WHERE id = $1', [inv.id, id]);
     await c.query(
       `INSERT INTO user_devices (user_id, device_id, status, last_ip) VALUES ($1, $2, 'pending', $3)
        ON CONFLICT (user_id, device_id) DO NOTHING`,
-      [u.id, req.device.id, clientIp(req)],
+      [id, req.device.id, clientIp(req)],
     );
   });
-  await audit(req, 'member_registered', { userId: u.id, username: u.username });
-  res.json({ status: 'pending_approval', fingerprint: fingerprint(u.public_key) });
+  await audit(req, 'member_registered', { userId: id, username: inv.username });
+  res.json({ status: 'pending_approval', fingerprint: fingerprint(publicKey) });
 });
 
 // ---------------------------------------------------------------------------
@@ -829,7 +734,6 @@ api.get('/admin/users', requireAdmin, async (req, res) => {
       status: u.status,
       publicKey: u.public_key,
       fingerprint: fingerprint(u.public_key),
-      totpEnabled: u.totp_enabled,
       locked: !!(u.locked_until && new Date(u.locked_until).getTime() > Date.now()),
       createdAt: u.created_at,
       lastLoginAt: u.last_login_at,
@@ -917,19 +821,6 @@ api.post('/admin/users/:id/role', requireAdmin, async (req, res) => {
     await c.query('UPDATE users SET role = $2 WHERE id = $1', [id, role]);
   });
   await audit(req, 'role_change', { details: { username, role } });
-  res.json({ ok: true });
-});
-
-api.post('/admin/users/:id/reset-totp', requireAdmin, async (req, res) => {
-  const id = v.uuid(req.params.id);
-  if (id === req.session.user_id) throw new HttpError(409, 'not_self');
-  const r = await q(
-    "UPDATE users SET totp_enabled = false, totp_secret = NULL, totp_pending = NULL WHERE id = $1 AND status = 'active' RETURNING username",
-    [id],
-  );
-  if (!r.rowCount) throw new HttpError(404, 'not_found');
-  await q('DELETE FROM sessions WHERE user_id = $1', [id]);
-  await audit(req, 'totp_reset', { details: { username: r.rows[0].username } });
   res.json({ ok: true });
 });
 

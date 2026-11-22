@@ -4,10 +4,6 @@ and fails on any console error (CSP / Trusted Types violations included).
 
   python3 test/e2e_browser.py <base_url> <setup_token> <screenshot_dir>
 """
-import base64
-import hashlib
-import hmac
-import struct
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -17,24 +13,6 @@ from playwright.sync_api import sync_playwright, expect
 BASE, SETUP_TOKEN, SHOTS = sys.argv[1], sys.argv[2], sys.argv[3]
 ADMIN_PW = 'Correct-Horse-Battery-77!'
 MEMBER_PW = 'Member-Strong-Pass-2026'
-
-
-class Auth:
-    def __init__(self, secret):
-        s = secret.replace(' ', '')
-        self.key = base64.b32decode(s + '=' * ((8 - len(s) % 8) % 8))
-        self.last = 0
-
-    def code(self):
-        now = int(time.time() // 30)
-        step = max(self.last + 1, now - 1)
-        while step > now + 1:
-            time.sleep(1)
-            now = int(time.time() // 30)
-        self.last = step
-        h = hmac.new(self.key, struct.pack('>Q', step), hashlib.sha1).digest()
-        o = h[-1] & 0x0F
-        return '%06d' % ((struct.unpack('>I', h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000)
 
 
 errors = []
@@ -94,17 +72,11 @@ with sync_playwright() as p:
     page.get_by_label('اسم المستخدم').fill('owner')
     page.get_by_label('كلمة السر الرئيسية', exact=True).fill(ADMIN_PW)
     page.get_by_label('أعد كتابة كلمة السر الرئيسية').fill(ADMIN_PW)
-    page.get_by_role('button', name='متابعة').click()
+    page.get_by_role('button', name='إنشاء الخزنة').click()
     expect(page.locator('.form-error')).to_contain_text('أكّد')  # checkbox is required
     page.locator('.check input').check()
-    page.get_by_role('button', name='متابعة').click()
-    expect(page.get_by_role('heading', name='فعّل التحقق بخطوتين')).to_be_visible(timeout=30000)
-    page.locator('.manual-key summary').click()
-    secret = page.locator('.manual-key code').inner_text()
-    admin_auth = Auth(secret)
-    shot(page, '02-totp')
-    page.get_by_label('الرمز من التطبيق').fill(admin_auth.code())
-    page.get_by_role('button', name='تفعيل وفتح الخزنة').click()
+    page.get_by_role('button', name='إنشاء الخزنة').click()
+    # no authenticator step: straight into the vault
     expect(page.get_by_role('heading', name='الخزنة فارغة')).to_be_visible(timeout=30000)
     shot(page, '03-empty-vault')
 
@@ -190,13 +162,8 @@ with sync_playwright() as p:
     mpage.get_by_label('أعد كتابة كلمة السر الرئيسية').fill(MEMBER_PW)
     mpage.locator('.check input').check()
     shot(mpage, '08-member-register')
-    mpage.get_by_role('button', name='متابعة').click()
-    expect(mpage.get_by_role('heading', name='فعّل التحقق بخطوتين')).to_be_visible(timeout=30000)
-    mpage.locator('.manual-key summary').click()
-    member_auth = Auth(mpage.locator('.manual-key code').inner_text())
-    mpage.get_by_label('الرمز من التطبيق').fill(member_auth.code())
-    mpage.get_by_role('button', name='تفعيل وإنهاء التسجيل').click()
-    expect(mpage.get_by_role('heading', name='حسابك جاهز وبانتظار موافقة المدير')).to_be_visible()
+    mpage.get_by_role('button', name='إنهاء التسجيل').click()
+    expect(mpage.get_by_role('heading', name='حسابك جاهز وبانتظار موافقة المدير')).to_be_visible(timeout=30000)
     member_fp = mpage.locator('.fingerprint').inner_text()
     shot(mpage, '09-member-pending')
 
@@ -212,7 +179,7 @@ with sync_playwright() as p:
     # ---------- member logs in and finds the client ----------
     mpage.get_by_role('button', name='تسجيل الدخول بعد الموافقة').click()
     mpage.get_by_label('كلمة السر الرئيسية').fill(MEMBER_PW)
-    mpage.get_by_label('رمز التحقق').fill(member_auth.code())
+    expect(mpage.get_by_label('رمز التحقق')).to_have_count(0)  # username + password only
     mpage.get_by_role('button', name='افتح الخزنة').click()
     expect(mpage.locator('.box')).to_have_count(4, timeout=30000)
     shot(mpage, '11-member-wall-mobile')
@@ -229,7 +196,6 @@ with sync_playwright() as p:
     m2page.goto(gate)
     m2page.get_by_label('اسم المستخدم').fill('sara')
     m2page.get_by_label('كلمة السر الرئيسية').fill(MEMBER_PW)
-    m2page.get_by_label('رمز التحقق').fill(member_auth.code())
     m2page.get_by_role('button', name='افتح الخزنة').click()
     expect(m2page.get_by_role('heading', name='هذا جهاز جديد')).to_be_visible(timeout=30000)
     shot(m2page, '13-device-pending')
@@ -348,7 +314,7 @@ with sync_playwright() as p:
     expect(page.locator('.person').filter(has_text='sara')).to_have_count(0)
     mpage.reload()
     expect(mpage.get_by_role('button', name='افتح الخزنة')).to_be_visible()
-    expect(mpage.get_by_label('رمز التحقق')).to_be_visible()  # back to full login: the account is gone
+    expect(mpage.get_by_label('اسم المستخدم')).to_be_visible()  # back to full login: the account is gone
     page.get_by_role('tab', name='رابط الدخول').click()
     shot(page, '17-admin-gate')
     # the billing notes moved to the new vault key with everything else

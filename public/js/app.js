@@ -194,15 +194,6 @@ function ltrInput(value = '', opts = {}) {
 function passwordInput(opts = {}) {
   return h('input', { type: 'password', dir: 'ltr', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', ...opts });
 }
-function otpInput() {
-  const el = h('input', {
-    type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6, dir: 'ltr', class: 'otp', placeholder: '••••••', spellcheck: 'false',
-  });
-  el.addEventListener('input', () => {
-    el.value = toLatinDigits(el.value).replace(/\D/g, '').slice(0, 6);
-  });
-  return el;
-}
 const formError = () => h('p', { class: 'form-error', role: 'alert' });
 
 function strengthMeter() {
@@ -332,7 +323,6 @@ function showMessage({ title, text, fingerprint = null, action = null, secondary
 function showLogin(prefill = '') {
   const user = ltrInput(prefill, { autocomplete: 'username', required: true, maxlength: 32 });
   const pw = passwordInput({ autocomplete: 'current-password', required: true });
-  const code = otpInput();
   const err = formError();
   const submit = button('افتح الخزنة', { kind: 'primary', type: 'submit', iconName: 'lock' });
   const form = h(
@@ -340,7 +330,6 @@ function showLogin(prefill = '') {
     { class: 'stack', novalidate: true },
     field('اسم المستخدم', user),
     field('كلمة السر الرئيسية', pw),
-    field('رمز التحقق', code, 'الأرقام الستة الظاهرة الآن في Google Authenticator أو Microsoft Authenticator.'),
     err,
     submit,
   );
@@ -349,8 +338,8 @@ function showLogin(prefill = '') {
     e.preventDefault();
     err.textContent = '';
     const username = user.value.trim().toLowerCase();
-    if (!username || !pw.value || code.value.length !== 6) {
-      err.textContent = 'اكتب اسم المستخدم وكلمة السر الرئيسية ورمز التحقق المكوّن من 6 أرقام.';
+    if (!username || !pw.value) {
+      err.textContent = 'اكتب اسم المستخدم وكلمة السر الرئيسية.';
       return;
     }
     setBusy(submit, true, 'جارٍ فتح الخزنة…');
@@ -358,14 +347,14 @@ function showLogin(prefill = '') {
     try {
       const pre = await api.post('/auth/prelogin', { username });
       const { authKey, kek } = await vc.deriveFromPassword(pw.value, pre.kdfSalt, pre.kdfIter);
-      const r = await api.post('/auth/login', { username, authKey, totp: code.value });
+      const r = await api.post('/auth/login', { username, authKey });
       working(shell, false);
       await afterLogin(r, kek, username);
     } catch (ex) {
       working(shell, false);
       setBusy(submit, false);
       err.textContent = errorText(ex);
-      code.value = '';
+      pw.select();
       shake(shell);
     }
   });
@@ -377,17 +366,6 @@ async function afterLogin(r, kek, username) {
   if (r.status === 'ok') return openVault(r, kek);
   if (r.status === 'device_pending') return showDevicePending(r.device, username);
   if (r.status === 'pending_approval') return showMemberPending(r.fingerprint, username);
-  if (r.status === 'totp_setup') {
-    return showTotpEnroll({
-      title: 'فعّل تطبيق المصادقة من جديد',
-      lead: 'تمت إعادة ضبط التحقق بخطوتين لحسابك. اربط تطبيق المصادقة على هاتفك قبل المتابعة.',
-      qr: r.qr,
-      secret: r.secret,
-      submitLabel: 'تفعيل ومتابعة',
-      onCode: (totp) => api.post('/auth/totp-setup', { ticket: r.ticket, totp }),
-      after: (r2) => afterLogin(r2, kek, username),
-    });
-  }
   return showLogin(username);
 }
 
@@ -463,52 +441,6 @@ function showUnlock(sess) {
   pw.focus();
 }
 
-function showTotpEnroll({ title, lead, qr, secret, onCode, after, submitLabel = 'تفعيل وفتح الخزنة' }) {
-  const code = otpInput();
-  const err = formError();
-  const submit = button(submitLabel, { kind: 'primary', type: 'submit', iconName: 'check' });
-  const form = h(
-    'form',
-    { class: 'stack', novalidate: true },
-    h(
-      'ol',
-      { class: 'steps' },
-      h('li', null, 'ثبّت تطبيق Google Authenticator أو Microsoft Authenticator على هاتفك.'),
-      h('li', null, 'اضغط «+» في التطبيق وامسح هذا الرمز.'),
-      h('li', null, 'اكتب الأرقام الستة التي تظهر في التطبيق.'),
-    ),
-    h('figure', { class: 'qr' }, h('img', { src: qr, alt: 'رمز QR لربط تطبيق المصادقة', width: 196, height: 196 })),
-    h('details', { class: 'manual-key' }, h('summary', null, 'لا يمكنك المسح؟ أدخل المفتاح يدويًا'), h('code', { class: 'mono', dir: 'ltr' }, secret)),
-    field('الرمز من التطبيق', code),
-    err,
-    submit,
-  );
-  const shell = authShell({ title, lead, body: form });
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    err.textContent = '';
-    if (code.value.length !== 6) {
-      err.textContent = 'اكتب الرمز المكوّن من 6 أرقام.';
-      return;
-    }
-    setBusy(submit, true, 'جارٍ التحقق…');
-    working(shell, true);
-    try {
-      const r = await onCode(code.value);
-      working(shell, false);
-      await after(r);
-    } catch (ex) {
-      working(shell, false);
-      setBusy(submit, false);
-      err.textContent = errorText(ex);
-      code.value = '';
-      shake(shell);
-    }
-  });
-  show(shell);
-  code.focus();
-}
-
 // Shared form for choosing a master password (first admin and invited members).
 function masterPasswordForm({ intro, withName, submitLabel, onSubmit }) {
   const name = textInput('', { maxlength: 60, autocomplete: 'name' });
@@ -563,7 +495,7 @@ function showSetup() {
   const f = masterPasswordForm({
     intro: h('p', null, 'ستُنشئ الآن حساب المدير الأول. كلمة السر الرئيسية هي المفتاح الوحيد لفك تشفير الخزنة، ولا يوجد أي طريق لاسترجاعها.'),
     withName: true,
-    submitLabel: 'متابعة',
+    submitLabel: 'إنشاء الخزنة',
     onSubmit: async ({ displayName, username, password }) => {
       const userId = vc.uuid();
       const salt = vc.newSalt();
@@ -580,14 +512,7 @@ function showSetup() {
         userId, username, displayName, kdfSalt: salt, kdfIter: vc.KDF_ITER, authKey,
         publicKey: keys.publicKey, encPrivateKey: keys.encPrivateKey, wrappedVaultKey: wrapped,
       });
-      showTotpEnroll({
-        title: 'فعّل التحقق بخطوتين',
-        lead: 'كل دخول للخزنة سيطلب رمزًا يتغير كل 30 ثانية من تطبيق على هاتفك.',
-        qr: r.qr,
-        secret: r.secret,
-        onCode: (totp) => api.post('/setup/finish', { username, totp }),
-        after: (r2) => openVault(r2, kek),
-      });
+      await openVault(r, kek);
     },
   });
   const shell = authShell({ title: 'تجهيز الخزنة لأول مرة', body: f.form });
@@ -619,29 +544,19 @@ async function showRegister(code) {
       h('p', { class: 'muted' }, 'اختر كلمة سر رئيسية خاصة بك. لا أحد غيرك يعرفها، ولا حتى المدير.'),
     ),
     withName: false,
-    submitLabel: 'متابعة',
+    submitLabel: 'إنهاء التسجيل',
     onSubmit: async ({ password }) => {
       const userId = vc.uuid();
       const salt = vc.newSalt();
       const { authKey, kek } = await vc.deriveFromPassword(password, salt, vc.KDF_ITER);
       const keys = await vc.createUserKeys(kek);
-      const r = await api.post('/register/start', {
+      await api.post('/register/start', {
         inviteCode: code, userId, kdfSalt: salt, kdfIter: vc.KDF_ITER, authKey, publicKey: keys.publicKey, encPrivateKey: keys.encPrivateKey,
       });
-      showTotpEnroll({
-        title: 'فعّل التحقق بخطوتين',
-        lead: 'كل دخول للخزنة سيطلب رمزًا يتغير كل 30 ثانية من تطبيق على هاتفك.',
-        qr: r.qr,
-        secret: r.secret,
-        submitLabel: 'تفعيل وإنهاء التسجيل',
-        onCode: (totp) => api.post('/register/finish', { inviteCode: code, totp }),
-        after: async () => {
-          history.replaceState(null, '', '/');
-          // Computed here from the key this browser generated, not taken from the server,
-          // so a tampered server can't show a matching fingerprint for a swapped key.
-          showMemberPending(await vc.fingerprint(keys.publicKey), info.username);
-        },
-      });
+      history.replaceState(null, '', '/');
+      // Computed here from the key this browser generated, not taken from the server,
+      // so a tampered server can't show a matching fingerprint for a swapped key.
+      showMemberPending(await vc.fingerprint(keys.publicKey), info.username);
     },
   });
   const shell = authShell({ title: 'انضم إلى خزنة الفريق', body: f.form });
@@ -1533,10 +1448,6 @@ function memberItem(u, panel) {
   const actions = [];
   if (!self) {
     actions.push(button(u.role === 'admin' ? 'جعله عضوًا' : 'جعله مديرًا', { kind: 'ghost', small: true, onClick: () => adminAct(`/admin/users/${u.id}/role`, { role: u.role === 'admin' ? 'member' : 'admin' }, 'تم تغيير الصلاحية.', panel) }));
-    actions.push(button('إعادة ضبط التحقق بخطوتين', { kind: 'ghost', small: true, onClick: async () => {
-      const ok = await confirmDialog({ title: 'إعادة ضبط التحقق بخطوتين؟', text: `استخدمها إذا فقد ${u.displayName} هاتفه. سيُطلب منه ربط تطبيق مصادقة جديد عند الدخول التالي، وسيُسجَّل خروجه الآن.`, confirmLabel: 'إعادة الضبط' });
-      if (ok) adminAct(`/admin/users/${u.id}/reset-totp`, {}, 'تمت إعادة الضبط.', panel);
-    } }));
   }
   if (u.locked) actions.push(button('فك القفل', { kind: 'secondary', small: true, onClick: () => adminAct(`/admin/users/${u.id}/unlock`, {}, 'تم فك القفل.', panel) }));
   if (!self) {
@@ -1552,7 +1463,6 @@ function memberItem(u, panel) {
       h('span', { class: 'mono', dir: 'ltr' }, u.username),
       h('span', { class: `tag${u.role === 'admin' ? ' tag-admin' : ''}` }, u.role === 'admin' ? 'مدير' : 'عضو'),
       u.locked ? h('span', { class: 'tag tag-danger' }, 'مقفول') : null,
-      !u.totpEnabled ? h('span', { class: 'tag tag-warn' }, 'لم يربط التحقق بخطوتين') : null,
     ),
     h('span', { class: 'muted' }, `آخر دخول: ${relTime(u.lastLoginAt)}`),
     h('div', { class: 'row-gap' }, actions),

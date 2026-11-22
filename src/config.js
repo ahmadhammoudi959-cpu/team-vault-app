@@ -7,7 +7,6 @@ const env = process.env;
 export const IS_PROD = env.NODE_ENV === 'production';
 export const PORT = Number(env.PORT) || 3000;
 export const APP_NAME = (env.APP_NAME || 'الخزنة').slice(0, 40);
-export const TOTP_ISSUER = (env.TOTP_ISSUER || 'Team Vault').slice(0, 40);
 export const DATABASE_URL = env.DATABASE_URL || '';
 export const RECOVERY_USER = (env.RECOVERY_USER || '').trim().toLowerCase() || null;
 export const DB_PLAN = (env.DB_PLAN || '').trim().toLowerCase();

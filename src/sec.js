@@ -61,49 +61,6 @@ export async function dummyAuth() {
   await hashAuth(crypto.randomBytes(32).toString('base64'), crypto.randomBytes(16));
 }
 
-// ---- TOTP (Google Authenticator / Microsoft Authenticator compatible) ----
-const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-
-export function base32(buf) {
-  let bits = 0;
-  let value = 0;
-  let out = '';
-  for (const byte of buf) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      out += B32[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
-    value &= (1 << bits) - 1;
-  }
-  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
-  return out;
-}
-
-export function hotp(secret, counter) {
-  const msg = Buffer.alloc(8);
-  msg.writeBigUInt64BE(BigInt(counter));
-  const h = crypto.createHmac('sha1', secret).update(msg).digest();
-  const off = h[h.length - 1] & 0x0f;
-  const code = (((h[off] & 0x7f) << 24) | (h[off + 1] << 16) | (h[off + 2] << 8) | h[off + 3]) % 1_000_000;
-  return String(code).padStart(6, '0');
-}
-
-export const newTotpSecret = () => crypto.randomBytes(20);
-
-// Returns the matched time-step, or null. Steps at or before lastStep are rejected,
-// so a code can never be used twice.
-export function checkTotp(secret, code, lastStep = 0, now = Date.now()) {
-  if (!/^\d{6}$/.test(String(code))) return null;
-  const cur = Math.floor(now / 30_000);
-  for (const step of [cur, cur - 1, cur + 1]) {
-    if (step <= lastStep) continue;
-    if (safeEqual(hotp(secret, step), code)) return step;
-  }
-  return null;
-}
-
 export function fingerprint(publicKeyB64) {
   const h = crypto.createHash('sha256').update(Buffer.from(publicKeyB64, 'base64')).digest();
   return h.subarray(0, 10).toString('hex').toUpperCase().match(/.{4}/g).join(' ');
